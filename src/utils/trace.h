@@ -37,7 +37,18 @@ PERFETTO_DEFINE_CATEGORIES(
 #endif
 
 #if USE_NVTX_TRACE
+#if __has_include(<nvtx3/nvtx3.hpp>)
 #include <nvtx3/nvtx3.hpp>
+#define LC0_NVTX_HAS_CPP_WRAPPER 1
+#elif __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define LC0_NVTX_HAS_CPP_WRAPPER 0
+#elif __has_include(<nvToolsExt.h>)
+#include <nvToolsExt.h>
+#define LC0_NVTX_HAS_CPP_WRAPPER 0
+#else
+#error "NVTX tracing enabled but no NVTX headers found"
+#endif
 #endif
 
 namespace lczero {
@@ -59,10 +70,18 @@ namespace lczero {
 #elif USE_NVTX_TRACE
 #define LCTRACE_DECLARE_CATEGORIES /* nop */
 #define LCTRACE_INITIALIZE         /* nop */
+#if LC0_NVTX_HAS_CPP_WRAPPER
 struct lc0_domain {
   static constexpr char name[] = "lc0";
 };
 #define LCTRACE_FUNCTION_SCOPE NVTX3_FUNC_RANGE_IN(lc0_domain)
+#else
+struct Lc0NvtxScopedRange {
+  explicit Lc0NvtxScopedRange(const char* name) { nvtxRangePushA(name); }
+  ~Lc0NvtxScopedRange() { nvtxRangePop(); }
+};
+#define LCTRACE_FUNCTION_SCOPE Lc0NvtxScopedRange lc0_nvtx_scope_(__func__)
+#endif
 #else
 
 #define LCTRACE_DECLARE_CATEGORIES

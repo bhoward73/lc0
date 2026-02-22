@@ -168,6 +168,7 @@ files += [
   'src/neural/backends/network_trivial.cc',
   'src/neural/memcache.cc',
   'src/neural/network_legacy.cc',
+  'src/neural/policy_value_batch.cc',
   'src/neural/onnx/adapters.cc',
   'src/neural/onnx/builder.cc',
   'src/neural/onnx/converter.cc',
@@ -839,11 +840,14 @@ endif
   ## nvtx
   ## ~~~~
   if trace_lib == 'nvtx'
-    nvtx_includes = get_option('cudnn_include')
+    nvtx_includes = get_option('cudnn_include') + ['/usr/include']
     nvtx_header_found = false
     foreach d : nvtx_includes
       if run_command('scripts/checkdir.py', d, check : false).returncode() == 0
-        if cc.has_header('nvtx3/nvtx3.hpp', args: '-I' + d)
+        has_nvtx3_hpp = cc.has_header('nvtx3/nvtx3.hpp', args: '-I' + d)
+        has_nvtx3_c = cc.has_header('nvtx3/nvToolsExt.h', args: '-I' + d)
+        has_nvtx_c = cc.has_header('nvToolsExt.h', args: '-I' + d)
+        if has_nvtx3_hpp or has_nvtx3_c or has_nvtx_c
           includes += include_directories(d)
           nvtx_header_found = true
           break
@@ -851,8 +855,9 @@ endif
       endif
     endforeach
     if not nvtx_header_found
-      error('nvtx3/nvtx3.hpp header not found in cudnn_include paths')
+      error('No compatible NVTX header found in cudnn_include paths')
     endif
+    deps += cc.find_library('nvToolsExt', required: true)
     # This could support other tracing apis like systemtap.
     trace_config.set('USE_NVTX_TRACE', 1)
   endif
@@ -910,6 +915,8 @@ configure_file(output : 'default_backend.h',
 if get_option('lc0')
   files += common_files
   executable('lc0', 'src/main.cc',
+       files, include_directories: includes, dependencies: deps, install: true)
+  executable('play', 'src/play.cc',
        files, include_directories: includes, dependencies: deps, install: true)
 endif
 
