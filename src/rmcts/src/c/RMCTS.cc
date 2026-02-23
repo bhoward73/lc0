@@ -1,3 +1,9 @@
+/*
+Copyright (c) 2025, Institute for Defense Analyses, 730 Glebe Rd, Alexandria, VA 22305-3086; 703-845-2500
+
+This material may be reproduced by or for the U.S. Government pursuant to all applicable FAR and DFARS clauses.
+*/
+
 #include <cassert>
 #include <cmath>
 #include <cstdint>
