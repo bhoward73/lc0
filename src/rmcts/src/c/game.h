@@ -1,9 +1,6 @@
 #include <stdlib.h>
 
 // ELEVEN REQUIRED METHODS, GAME STATE IS AN ARRAY OF FLOATS (32bit) (1 DIML), DENOTED 'g' BELOW:
-// All input and output arrays will be allocated outside of game.c
-// However, one could of course introduce internal arrays to facilitate computations,
-// but the primary thought is to use g for all useful data concerning the game state.
 
 int numActions(void);
 
