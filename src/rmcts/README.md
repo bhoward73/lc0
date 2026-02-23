@@ -5,7 +5,7 @@ Benjamin Howard (bhoward73@gmail.com, or bjhowa3@idaccr.org), and
 Keith Frankston (k.frankston@fastmail.com, or k.frankston@idaccr.org)
 
 The main code sits in ./src/c/RMCTS.cc and contains an implementation of the RMCTS 
-algorithm described in the paper here ./rmcts.pdf
+algorithm described in the paper rmcts.pdf.
 There is a git repo at https://gitlab.com/bhoward73/rmcts with a 
 standalone version; here, it is intended to be an experimental search option for lc0.
 Much of the transfer was vibe-coded using GPT-5.3-Codex.  
