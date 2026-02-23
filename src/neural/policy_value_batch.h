@@ -54,6 +54,7 @@ class PolicyValueBatchEvaluator {
                                      bool white_pov_values = true);
 
   PolicyValueBatch Evaluate(const std::vector<GameState>& batch);
+  size_t GetBackendMaxBatchSize() const;
 
  private:
   const bool white_pov_values_;

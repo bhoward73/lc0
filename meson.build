@@ -204,6 +204,10 @@ files += [
 
 files += [
   'src/search/instamove/instamove.cc',
+  'src/search/rmcts/wrapper.cc',
+  'src/search/rmcts/game_adapter.cc',
+  'src/rmcts/src/c/RMCTS.cc',
+  'src/rmcts/src/c/random.cc',
 ]
 
 includes += include_directories('src')
@@ -912,12 +916,23 @@ endif
 configure_file(output : 'default_backend.h',
                configuration : default_backend_h)
 
+rmcts_includes = include_directories('src/rmcts/src/c')
+rmcts_core_lib = static_library('rmcts_core',
+                                [
+                                  'src/rmcts/src/c/RMCTS.cc',
+                                  'src/rmcts/src/c/random.cc',
+                                ],
+                                include_directories: [includes, rmcts_includes])
+alias_target('rmcts_core', rmcts_core_lib)
+
 if get_option('lc0')
   files += common_files
   executable('lc0', 'src/main.cc',
        files, include_directories: includes, dependencies: deps, install: true)
   executable('play', 'src/play.cc',
        files, include_directories: includes, dependencies: deps, install: true)
+  executable('state_batch_bench', 'src/state_batch_bench.cc',
+    files, include_directories: includes, dependencies: deps, install: true)
 endif
 
 #############################################################################

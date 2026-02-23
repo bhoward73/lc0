@@ -1,3 +1,4 @@
+
 #include <algorithm>
 #include <cctype>
 #include <iomanip>
@@ -164,6 +165,9 @@ class BestMoveCaptureResponder : public lczero::UciResponder {
         std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& info : *infos) {
             if (info.multipv > 1) continue;
+            if (info.nodes >= 0) nodes_ = info.nodes;
+            if (info.nps >= 0) nps_ = info.nps;
+            if (info.time >= 0) time_ms_ = info.time;
             if (info.wdl) {
                 eval_stm_ = static_cast<double>(info.wdl->w - info.wdl->l) / 1000.0;
             }
@@ -180,6 +184,9 @@ class BestMoveCaptureResponder : public lczero::UciResponder {
         std::lock_guard<std::mutex> lock(mutex_);
         best_move_.reset();
         eval_stm_.reset();
+        nodes_.reset();
+        nps_.reset();
+        time_ms_.reset();
         policy_by_move_.clear();
     }
 
@@ -201,6 +208,21 @@ class BestMoveCaptureResponder : public lczero::UciResponder {
             stats.push_back(value);
         }
         return stats;
+    }
+
+    std::optional<std::int64_t> GetNodes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return nodes_;
+    }
+
+    std::optional<int> GetNps() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return nps_;
+    }
+
+    std::optional<std::int64_t> GetTimeMs() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return time_ms_;
     }
 
  private:
@@ -261,6 +283,9 @@ class BestMoveCaptureResponder : public lczero::UciResponder {
     mutable std::mutex mutex_;
     std::optional<lczero::Move> best_move_;
     std::optional<double> eval_stm_;
+    std::optional<std::int64_t> nodes_;
+    std::optional<int> nps_;
+    std::optional<std::int64_t> time_ms_;
     std::unordered_map<std::string, PolicyStat> policy_by_move_;
 };
 
@@ -276,6 +301,29 @@ std::optional<std::string> ParseWeightsFlag(int argc, const char** argv) {
     return std::nullopt;
 }
 
+std::optional<std::string> ParseStringFlag(int argc, const char** argv,
+                                           std::string_view prefix) {
+    for (int idx = 1; idx < argc; ++idx) {
+        const std::string_view arg(argv[idx]);
+        if (arg.size() >= prefix.size() &&
+            arg.substr(0, prefix.size()) == prefix) {
+            return std::string(arg.substr(prefix.size()));
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<int> ParseIntFlag(int argc, const char** argv,
+                                std::string_view prefix) {
+    const auto value = ParseStringFlag(argc, argv, prefix);
+    if (!value) return std::nullopt;
+    try {
+        return std::stoi(*value);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 bool HasFlag(int argc, const char** argv, std::string_view flag) {
     for (int idx = 1; idx < argc; ++idx) {
         if (std::string_view(argv[idx]) == flag) return true;
@@ -288,10 +336,19 @@ void PrintHelp(const char* binary_name) {
               << "Options:\n"
               << "  --help, -h          Show this help and exit\n"
               << "  --weights=<path>    Path to network weights file\n"
+              << "  --backend=<name>    Backend name (e.g. cuda, onnx-trt, onnx-cuda)\n"
+              << "  --backend-opts=<s>  Backend options string (key=value,...)\n"
+              << "  --movetime-ms=N     Search time per move in milliseconds\n"
+              << "  --move-overhead-ms=N  Time safety margin subtracted from movetime\n"
+              << "  --threads=N         Number of search worker threads (0 = backend default)\n"
+              << "  --minibatch-size=N  Search minibatch size (0 = auto)\n"
+              << "  --max-prefetch=N    Search prefetch batch size\n"
+              << "  --max-half-moves=N  Stop after N half-moves (plies)\n"
               << "  --human             Enable human-vs-bot mode\n"
               << "  --no-pause          In bot mode, do not pause between moves\n\n"
               << "Notes:\n"
-              << "  - Search currently uses fixed movetime (300 ms) per move.\n"
+              << "  - Default search movetime is 300 ms per move.\n"
+              << "  - Default move overhead is 0 ms in this app.\n"
               << "  - In human mode, type moves in UCI format (e.g. e2e4, e7e8q).\n"
               << "  - You can type 'show policy' on your turn to inspect root policy.\n";
 }
@@ -389,9 +446,16 @@ int main(int argc, const char** argv) {
     lczero::PositionHistory history;
     history.Reset(lczero::Position::FromFen(lczero::ChessBoard::kStartposFen));
 
-    auto* factory = lczero::SearchManager::Get()->GetFactoryByName("classic");
+    std::string search_name = "classic";
+    if (const auto parsed_search = ParseStringFlag(argc, argv, "--search=");
+        parsed_search) {
+        search_name = *parsed_search;
+    }
+
+    auto* factory = lczero::SearchManager::Get()->GetFactoryByName(search_name);
     if (!factory) {
-        std::cerr << "Search algorithm 'classic' is not available." << std::endl;
+        std::cerr << "Search algorithm '" << search_name
+                  << "' is not available." << std::endl;
         return 1;
     }
 
@@ -399,12 +463,119 @@ int main(int argc, const char** argv) {
     lczero::Engine::PopulateOptions(&options_parser);
     factory->PopulateParams(&options_parser);
     lczero::SharedBackendParams::Populate(&options_parser);
-    options_parser.GetMutableDefaultsOptions()->Set<bool>(
-        lczero::classic::BaseSearchParams::kVerboseStatsId, true);
+
+    const bool is_classic_search = (search_name == "classic");
+
+    int move_overhead_ms = 0;
+    if (const auto parsed_move_overhead =
+            ParseIntFlag(argc, argv, "--move-overhead-ms=");
+        parsed_move_overhead) {
+        if (*parsed_move_overhead < 0) {
+            std::cerr << "Invalid value for --move-overhead-ms."
+                      << " Expected a non-negative integer." << std::endl;
+            return 1;
+        }
+        move_overhead_ms = *parsed_move_overhead;
+    }
+    if (is_classic_search) {
+        options_parser.GetMutableDefaultsOptions()->Set<int>("move-overhead",
+                                                             move_overhead_ms);
+        options_parser.SetUciOption("MoveOverheadMs",
+                                    std::to_string(move_overhead_ms));
+        options_parser.GetMutableDefaultsOptions()->Set<bool>(
+            lczero::classic::BaseSearchParams::kVerboseStatsId, true);
+    }
     if (const auto weights_path = ParseWeightsFlag(argc, argv); weights_path) {
         options_parser.GetMutableDefaultsOptions()->Set<std::string>(
             lczero::SharedBackendParams::kWeightsId, *weights_path);
     }
+    if (const auto backend =
+            ParseStringFlag(argc, argv, "--backend=");
+        backend) {
+        options_parser.GetMutableDefaultsOptions()->Set<std::string>(
+            lczero::SharedBackendParams::kBackendId, *backend);
+    }
+    if (const auto backend_opts =
+            ParseStringFlag(argc, argv, "--backend-opts=");
+        backend_opts) {
+        options_parser.GetMutableDefaultsOptions()->Set<std::string>(
+            lczero::SharedBackendParams::kBackendOptionsId, *backend_opts);
+    }
+
+    int move_time_ms = 300;
+    if (const auto parsed_movetime = ParseIntFlag(argc, argv, "--movetime-ms=");
+        parsed_movetime) {
+        if (*parsed_movetime <= 0) {
+            std::cerr << "Invalid value for --movetime-ms."
+                      << " Expected a positive integer." << std::endl;
+            return 1;
+        }
+        move_time_ms = *parsed_movetime;
+    }
+
+    int threads = 0;
+    if (const auto parsed_threads = ParseIntFlag(argc, argv, "--threads=");
+        parsed_threads) {
+        if (*parsed_threads < 0) {
+            std::cerr << "Invalid value for --threads."
+                      << " Expected a non-negative integer." << std::endl;
+            return 1;
+        }
+        threads = *parsed_threads;
+    }
+    if (is_classic_search) {
+        options_parser.GetMutableDefaultsOptions()->Set<int>("threads", threads);
+        options_parser.SetUciOption("Threads", std::to_string(threads));
+    }
+
+    if (is_classic_search) {
+        if (const auto minibatch_size =
+                ParseIntFlag(argc, argv, "--minibatch-size=");
+            minibatch_size) {
+            if (*minibatch_size < 0) {
+                std::cerr << "Invalid value for --minibatch-size."
+                          << " Expected a non-negative integer." << std::endl;
+                return 1;
+            }
+            options_parser.GetMutableDefaultsOptions()->Set<int>(
+                lczero::classic::BaseSearchParams::kMiniBatchSizeId,
+                *minibatch_size);
+        }
+
+        if (const auto max_prefetch = ParseIntFlag(argc, argv, "--max-prefetch=");
+            max_prefetch) {
+            if (*max_prefetch < 0) {
+                std::cerr << "Invalid value for --max-prefetch."
+                          << " Expected a non-negative integer." << std::endl;
+                return 1;
+            }
+            options_parser.GetMutableDefaultsOptions()->Set<int>(
+                lczero::classic::SearchParams::kMaxPrefetchBatchId,
+                *max_prefetch);
+        }
+    }
+
+    int minibatch_size_effective = -1;
+    int max_prefetch_effective = -1;
+    if (is_classic_search) {
+        minibatch_size_effective = options_parser.GetOptionsDict().Get<int>(
+            lczero::classic::BaseSearchParams::kMiniBatchSizeId);
+        max_prefetch_effective = options_parser.GetOptionsDict().Get<int>(
+            lczero::classic::SearchParams::kMaxPrefetchBatchId);
+    }
+
+    int max_half_moves = 400;
+    if (const auto parsed_max_half_moves =
+            ParseIntFlag(argc, argv, "--max-half-moves=");
+        parsed_max_half_moves) {
+        if (*parsed_max_half_moves <= 0) {
+            std::cerr << "Invalid value for --max-half-moves."
+                      << " Expected a positive integer." << std::endl;
+            return 1;
+        }
+        max_half_moves = *parsed_max_half_moves;
+    }
+
     const lczero::OptionsDict& options = options_parser.GetOptionsDict();
 
     const bool human_mode = HasFlag(argc, argv, "--human");
@@ -426,12 +597,17 @@ int main(int argc, const char** argv) {
     } else {
         std::cout << "--- STARTING BOT PLAYOUT ---" << std::endl;
     }
+    std::cout << "Config: movetime_ms=" << move_time_ms
+              << " search=" << search_name
+              << " move_overhead_ms=" << move_overhead_ms
+              << " threads=" << threads
+              << " minibatch_size=" << minibatch_size_effective
+              << " max_prefetch=" << max_prefetch_effective << std::endl;
 
     int half_moves = 0;
     constexpr bool is_chess960 = false;
-    constexpr std::int64_t kMoveTimeMs = 300;
 
-    while (half_moves < 400) {
+    while (half_moves < max_half_moves) {
         const lczero::GameResult game_result = history.ComputeGameResult();
         if (game_result != lczero::GameResult::UNDECIDED) {
             std::cout << GameResultMessage(history) << std::endl;
@@ -467,7 +643,7 @@ int main(int argc, const char** argv) {
                     responder.Reset();
                     engine.SetPosition(lczero::PositionToFen(pos), {});
                     lczero::GoParams params;
-                    params.movetime = kMoveTimeMs;
+                    params.movetime = move_time_ms;
                     engine.Go(params);
                     engine.Wait();
                     PrintPolicyTable(responder.GetPolicyStats());
@@ -490,7 +666,7 @@ int main(int argc, const char** argv) {
             responder.Reset();
             engine.SetPosition(lczero::PositionToFen(pos), {});
             lczero::GoParams params;
-            params.movetime = kMoveTimeMs;
+            params.movetime = move_time_ms;
             engine.Go(params);
             engine.Wait();
 
@@ -504,6 +680,16 @@ int main(int argc, const char** argv) {
                 std::cout << "Eval (white): " << std::showpos << std::fixed
                           << std::setprecision(3) << eval_white << std::noshowpos
                           << std::defaultfloat << '\n';
+            }
+            const auto nodes = responder.GetNodes();
+            const auto nps = responder.GetNps();
+            const auto elapsed_ms = responder.GetTimeMs();
+            if (nodes || nps || elapsed_ms) {
+                std::cout << "Search: "
+                          << "time_ms=" << (elapsed_ms ? std::to_string(*elapsed_ms) : "?")
+                          << " nodes=" << (nodes ? std::to_string(*nodes) : "?")
+                          << " nps=" << (nps ? std::to_string(*nps) : "?")
+                          << '\n';
             }
             chosen_move = *best_move;
             if (pos.IsBlackToMove()) {
@@ -534,8 +720,9 @@ int main(int argc, const char** argv) {
         half_moves++;
     }
 
-    if (half_moves >= 400) {
-        std::cout << "Game Over: Reached 400 half-moves failsafe." << std::endl;
+    if (half_moves >= max_half_moves) {
+        std::cout << "Game Over: Reached " << max_half_moves
+                  << " half-moves limit." << std::endl;
     }
 
     engine.UnregisterUciResponder(&responder);

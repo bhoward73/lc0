@@ -38,6 +38,10 @@ PolicyValueBatchEvaluator::PolicyValueBatchEvaluator(const OptionsDict& options,
       backend_(CreateMemCache(BackendManager::Get()->CreateFromParams(options),
                               options)) {}
 
+size_t PolicyValueBatchEvaluator::GetBackendMaxBatchSize() const {
+  return std::max<size_t>(1, backend_->GetAttributes().maximum_batch_size);
+}
+
 PolicyValueBatch PolicyValueBatchEvaluator::Evaluate(
   const std::vector<GameState>& batch) {
   std::vector<std::vector<Position>> positions_storage;
@@ -57,7 +61,23 @@ PolicyValueBatch PolicyValueBatchEvaluator::Evaluate(
         EvalPosition{positions_storage.back(), legal_moves_storage.back()});
   }
 
-  std::vector<EvalResult> eval_results = backend_->EvaluateBatch(eval_positions);
+  const size_t backend_max_batch =
+      std::max<size_t>(1, backend_->GetAttributes().maximum_batch_size);
+  std::vector<EvalResult> eval_results;
+  eval_results.reserve(eval_positions.size());
+  for (size_t offset = 0; offset < eval_positions.size();
+       offset += backend_max_batch) {
+    const size_t take = std::min(backend_max_batch, eval_positions.size() - offset);
+    std::vector<EvalPosition> subbatch;
+    subbatch.reserve(take);
+    for (size_t i = 0; i < take; ++i) {
+      subbatch.emplace_back(eval_positions[offset + i]);
+    }
+    auto sub_results = backend_->EvaluateBatch(subbatch);
+    eval_results.insert(eval_results.end(),
+                        std::make_move_iterator(sub_results.begin()),
+                        std::make_move_iterator(sub_results.end()));
+  }
 
   PolicyValueBatch output;
   output.pi.assign(batch.size(),
