@@ -20,7 +20,27 @@ This material may be reproduced by or for the U.S. Government pursuant to all ap
 #define UCB_EPSILON 0.1
 
 #define POSTERIOR_POLICY_ALGORITHM new_policy_common_ucb_Newton
-//#define POSTERIOR_POLICY_ALGORITHM new_policy_common_ucb_Simple
+
+bool rmcts_debug_root_enabled() {
+  static int initialized = 0;
+  static bool enabled = false;
+  if (!initialized) {
+    const char* env = std::getenv("RMCTS_DEBUG_ROOT");
+    enabled = env && env[0] && env[0] != '0';
+    initialized = 1;
+  }
+  return enabled;
+}
+
+int posterior_effective_T_from_N(const float* N, int n) {
+  float sum_N = 0.0f;
+  for (int i = 0; i < n; ++i) {
+    sum_N += N[i];
+  }
+  if (!std::isfinite(sum_N) || sum_N <= 0.0f) return 1;
+  const int T = static_cast<int>(std::lround(sum_N));
+  return (T > 0) ? T : 1;
+}
 
 float sum_of_float_array(float* a, int len_a) {
   int i;
@@ -73,7 +93,6 @@ int maximum_of_int_array(int* a, int len_a) {
   return m;
 }
 
-//debug
 int bound_test(float* x, int len_x, float bound) {
   int i;
   for(i=0;i<len_x;i++) {
@@ -82,10 +101,10 @@ int bound_test(float* x, int len_x, float bound) {
   return 1;
 }
 
-void assign_simulations(int* chunksizes, int budget, float* pi, int n) {
+void assign_simulations(int* sims_per_action, int budget, float* pi, int n) {
   assert(n > 0);
   if (budget <= 0) {
-    memset(chunksizes, 0, n * sizeof(int));
+    memset(sims_per_action, 0, n * sizeof(int));
     return;
   }
   float x; // random number in [0,1)
@@ -104,11 +123,11 @@ void assign_simulations(int* chunksizes, int budget, float* pi, int n) {
     s = pi[0]*budget;
     i = 0;
     count = 0;
-    memset(chunksizes,0,n*sizeof(int));
+    memset(sims_per_action,0,n*sizeof(int));
     while((count < budget) && (x < budget) && (i<n)) {
       //printf("x = %.2f, s = %.2f, i = %d\n",x,s,i);
       if(x < s) {
-        chunksizes[i]++;
+        sims_per_action[i]++;
         x += 1.0;
         count++;
       } 
@@ -179,8 +198,7 @@ void new_policy_common_ucb_Newton(float* pi1, int n, float* Q, float c, float* p
   for(i=0;i<n;i++) pi1[i] /= sum_pi;
 }
 
-// simpler version which is simpler than Newton; based on asymptotic approximation
-// but is not equivalent (it essentially makes the c constant adjustable)
+// Alternative posterior policy update (kept for experimentation).
 void new_policy_common_ucb_Simple(float* pi1, int n, float* Q, float c, float* pi0, int T) {
   int i;
   float c0 = c / sqrt((float) T);
@@ -202,7 +220,7 @@ void new_policy_common_ucb_Simple(float* pi1, int n, float* Q, float c, float* p
   }
 } 
 
-void legalize_policy(float* pi_legal, float* pi, float* g) {
+void legalize_policy(float* pi_legal, float* pi, GameStateHandle g) {
   int n = numActions();
   int num_valid_actions;
   std::vector<int> actions(n);
@@ -210,40 +228,51 @@ void legalize_policy(float* pi_legal, float* pi, float* g) {
   num_valid_actions = getValidActions(actions.data(), g);
   assert(num_valid_actions > 0);
   memset(pi_legal, 0, n*sizeof(float));
-  for(i=0;i<num_valid_actions;i++) {
-    pi_legal[actions[i]] = pi[actions[i]];
+
+  // Build the legal-only prior and compute Z0 = sum_{a in L} pi0(a).
+  // Then mix normalized legal prior with uniform on L, using Z0 as the
+  // trust weight: pi0_legal = Z0 * pi0_L + (1-Z0) * U_L.
+  float z0 = 0.0f;
+  for (i = 0; i < num_valid_actions; i++) {
+    const int a = actions[i];
+    const float p = std::max(0.0f, pi[a]);
+    pi_legal[a] = p;
+    z0 += p;
   }
-  float sum_pi = sum_of_float_array(pi_legal, n);
-  if (!std::isfinite(sum_pi) || sum_pi <= 0.0f) {
+
+  if (!std::isfinite(z0) || z0 <= 0.0f) {
     const float uniform = 1.0f / static_cast<float>(num_valid_actions);
     for (i = 0; i < num_valid_actions; i++) {
       pi_legal[actions[i]] = uniform;
     }
-  } else {
-    for(i=0;i<n;i++) pi_legal[i] /= sum_pi;
+    return;
+  }
+
+  const float z0_clamped = std::min(1.0f, std::max(0.0f, z0));
+  const float uniform = 1.0f / static_cast<float>(num_valid_actions);
+  for (i = 0; i < num_valid_actions; i++) {
+    const int a = actions[i];
+    const float pi0_l = pi_legal[a] / z0;
+    pi_legal[a] = z0_clamped * pi0_l + (1.0f - z0_clamped) * uniform;
   }
 }
 
-
-
-// all the array data is allocated in python
-// partly because we want to see this data in python
-// we assume that the policy and value 
-// for the root states are already computed
-// and sitting in the policy and value arrays
-// we also assume that the root states are sitting in the G array
-// hence the state should be that the inference_stack is empty
-// but the new_stack is full of root states (only)
+// Initialization assumes root rows are already populated by the caller:
+// - root states in G
+// - root policy/value in policy/value
+// - inference stack empty
+// - new stack seeded with root rows
 void* MCTS_init(int const num_lanes,  
 				int const numSims,
         float const c_puct,
         float* new_policy,
 				float* new_value, 
-				float* G,
+        GameStateHandle* G,
 				float* policy,
 				float* value,
 				float* Q,
 				float* N,
+        int32_t* child,
 				int32_t* parent,
 				int32_t* a0,
 				int32_t* sims,
@@ -268,6 +297,7 @@ void* MCTS_init(int const num_lanes,
   t->value = value;
   t->Q = Q;
   t->N = N;
+  t->child = child;
   
   t->parent = parent;
   t->a0 = a0;
@@ -294,18 +324,28 @@ int update_parent(MCTS_new_t* const t, int parent, int a0, float v_child, int si
   // returns the number of simulations remaining for the parent
   float v, player_id_parent;
   int n = numActions();
-  int gamesize = gameLength();
   float* Q;
   float* N;
 
   assert(t->sims_remaining[parent] >= 1 + sims_child);
-  player_id_parent = playerId(t->G + parent*gamesize);
+  player_id_parent = playerId(t->G[parent]);
   v = v_child * player_id_child * player_id_parent;
   Q = t->Q + parent*n;
   N = t->N + parent*n;
+  const float q_old = Q[a0];
+  const float n_old = N[a0];
   Q[a0] = (Q[a0]*N[a0] + v*sims_child)/(N[a0] + sims_child);
   N[a0] += sims_child;
   t->sims_remaining[parent] -= sims_child;
+
+  if (rmcts_debug_root_enabled() && parent < t->num_lanes) {
+    std::printf(
+        "RMCTS_ROOT_UPDATE a=%d sims_child=%d v_child=%.6f pid_child=%.1f pid_parent=%.1f "
+        "v_used=%.6f Q_old=%.6f N_old=%.0f Q_new=%.6f N_new=%.0f sims_rem=%d\n",
+        a0, sims_child, v_child, player_id_child, player_id_parent, v, q_old,
+        n_old, Q[a0], N[a0], t->sims_remaining[parent]);
+    std::fflush(stdout);
+  }
   return t->sims_remaining[parent];
 }
 
@@ -325,12 +365,12 @@ float compute_new_value_nonroot(MCTS_new_t* t, int idx) {
   float reciprocal_new_portion;
   int i,a;
   int n = numActions();
-  int T = t->sims[idx] - 1;
 
   v0 = t->value[idx]; // network value for this state
   pi0 = t->policy + idx*n; // should already be legalized
   Q = t->Q + idx*n;
   N = t->N + idx*n;
+  int T = posterior_effective_T_from_N(N, n);
 
   std::vector<int> mask(n);
   std::vector<float> pi0_mask(n, 0.0f);
@@ -360,6 +400,8 @@ float compute_new_value_nonroot(MCTS_new_t* t, int idx) {
   POSTERIOR_POLICY_ALGORITHM(pi1_mask.data(), len_mask, Q_mask.data(), t->c_puct, pi0_mask.data(), T);
   // new_policy_common_ucb_Newton(pi1_mask, len_mask, Q_mask, t->c_puct, pi0_mask, T);
 
+  // Posterior value is computed on measured actions only, using the
+  // undampened posterior distribution pi1_mask over that set.
   v = 0.0;
   for(i=0;i<len_mask;i++) {
     v += pi1_mask[i]*Q_mask[i];
@@ -385,12 +427,11 @@ float compute_new_value_and_policy_root(MCTS_new_t* t, int idx) {
   int i,a;
   int n = numActions();
 
-  int T = t->sims[idx] - 1;
-
   v0 = t->value[idx]; // network value for this state
   pi0 = t->policy + idx*n; // should already be legalized
   Q = t->Q + idx*n;
   N = t->N + idx*n;
+  int T = posterior_effective_T_from_N(N, n);
 
   std::vector<int> mask(n);
   std::vector<float> pi0_mask(n, 0.0f);
@@ -426,11 +467,22 @@ float compute_new_value_and_policy_root(MCTS_new_t* t, int idx) {
   for(i=0;i<len_mask;i++) {
     v += pi1_mask[i]*Q_mask[i];
   }
+  const float v_measured = v;
   v += (v0-v)/(T+1);
 
+  if (rmcts_debug_root_enabled()) {
+    std::printf(
+        "RMCTS_ROOT_POSTERIOR idx=%d ZA=%.6f v_measured=%.6f v_final=%.6f v0=%.6f T=%d\n",
+        idx, new_portion, v_measured, v, v0, T);
+    std::fflush(stdout);
+  }
+
   // finally compute the new policy pi1
-  for(i=0;i<len_mask;i++) {
-    pi1[mask[i]] = pi1_mask[i];
+  // Keep prior mass on actions outside A (where N[a] == 0).
+  // On A, assign pi1_A scaled by ZA, where ZA = sum_{a in A} pi0[a].
+  memcpy(pi1.data(), pi0, n * sizeof(float));
+  for (i = 0; i < len_mask; i++) {
+    pi1[mask[i]] = pi1_mask[i] * new_portion;
   }
 
   // copy the new policy and new value in the data array
@@ -440,16 +492,8 @@ float compute_new_value_and_policy_root(MCTS_new_t* t, int idx) {
   return v;
 }
 
-
-/* a child state sends its own value v_child and 
-number of simulations sims_child
-to the parent.
-parent updates Q[a0], N[a0], and sims (remaining).
-if sims remaining of parent becomes 1,
-then the parent moves up to grandparent, etc, 
-until the sims > 1, or until reaching 
-one of the original root states. */
-
+// Propagates one completed child contribution upward; continues while each
+// ancestor has exactly one simulation remaining and can be finalized.
 void propagate(MCTS_new_t* t, int parent, int a0, float v_child, int sims_child, float player_id_child) 
 {
   int child;
@@ -466,7 +510,7 @@ void propagate(MCTS_new_t* t, int parent, int a0, float v_child, int sims_child,
     child = parent;
     v_child = compute_new_value_nonroot(t, child);
     sims_child = t->sims[child];
-    player_id_child = playerId(t->G + child*gameLength());
+    player_id_child = playerId(t->G[child]);
     a0 = t->a0[child];
     parent = t->parent[child];
     t->sims_remaining[child] = 0;
@@ -474,18 +518,12 @@ void propagate(MCTS_new_t* t, int parent, int a0, float v_child, int sims_child,
   }
 }
 
-
-// completely flushes the new_stack
-// and populates the inference_stack with whatever inferences are required
+// Two-phase flush:
+// 1) expand current new_stack and queue backup events,
+// 2) execute queued backups/propagation.
 void MCTS_flush_new_stack(void* const mcts)
 {
   MCTS_new_t* t = (MCTS_new_t*) mcts;
-  // first I will do this without dictionaries
-  // which is really only correct for nonrandom games
-  // each action is taken a certain number of times
-  // but I will assume that whichever state appears 
-  // the first time will be repeated the same number of times
-  // as the action multiplicity
   int i0;
   // int i;
   int numSims;
@@ -493,12 +531,11 @@ void MCTS_flush_new_stack(void* const mcts)
   int a0,a;
   float v0, v_child;
   float player_g, player_h;
-  float* g;
+  GameStateHandle g;
   float* pi0;
-  int gamesize = gameLength();
   int n = numActions();
   const int capacity = t->num_lanes * t->numSims;
-  std::vector<float> h(gamesize);
+  GameStateHandle h = 0;
   std::vector<float> pi0_legal(n);
   std::vector<int> action_counts(n);
   int m;
@@ -524,7 +561,7 @@ void MCTS_flush_new_stack(void* const mcts)
 
   while(*(t->new_stack_size) > 0) {
     i0 = t->new_stack[*(t->new_stack_size)-1];
-    g = t->G + i0*gamesize;
+    g = t->G[i0];
     t->new_stack_size[0]--;
     numSims = t->sims[i0];
     assert(numSims >= 1);
@@ -554,27 +591,51 @@ void MCTS_flush_new_stack(void* const mcts)
     // not a leaf, so assigning action counts
     // and pushing the children onto the stack
     assign_simulations(action_counts.data(), numSims-1, pi0_legal.data(), n);
+
+    if (rmcts_debug_root_enabled() && i0 < t->num_lanes) {
+      std::printf("RMCTS_ROOT_ALLOC root=%d sims=%d\n", i0, numSims - 1);
+      for (a = 0; a < n; a++) {
+        if (action_counts[a] > 0) {
+          std::printf("  a=%d count=%d prior=%.6f\n", a, action_counts[a],
+                      pi0_legal[a]);
+        }
+      }
+      std::fflush(stdout);
+    }
+
     for(a=0;a<n;a++) {
       if(action_counts[a] == 0) continue;
-      nextState(h.data(), g, a);
-      player_h = playerId(h.data());
-      ended = gameEnded(&score, h.data());
+      nextState(&h, g, a);
+      player_h = playerId(h);
+      ended = gameEnded(&score, h);
       if(ended) {
         v_child = score * player_h;
         pending.push_back({i0, a, v_child, action_counts[a], player_h, -1});
         continue;
       }
-      m = t->row_count[0];
-      assert(m >= 0 && m < capacity);
-      assert(*(t->inference_stack_size) >= 0 && *(t->inference_stack_size) < capacity);
-      memcpy(t->G + m*gamesize, h.data(), gamesize*sizeof(float));
-      t->parent[m] = i0;
-      t->a0[m] = a;
-      t->sims[m] = action_counts[a];
-      t->sims_remaining[m] = action_counts[a];
-      t->inference_stack[*(t->inference_stack_size)] = m;
-      t->inference_stack_size[0]++;
-      t->row_count[0]++;
+      const int child_idx = i0 * n + a;
+      m = t->child[child_idx];
+      if (m < 0) {
+        m = t->row_count[0];
+        assert(m >= 0 && m < capacity);
+        assert(*(t->inference_stack_size) >= 0 && *(t->inference_stack_size) < capacity);
+        t->child[child_idx] = m;
+        t->G[m] = h;
+        t->parent[m] = i0;
+        t->a0[m] = a;
+        t->sims[m] = action_counts[a];
+        t->sims_remaining[m] = action_counts[a];
+        t->inference_stack[*(t->inference_stack_size)] = m;
+        t->inference_stack_size[0]++;
+        t->row_count[0]++;
+      } else {
+        // Existing subtree row: assign only new sims for this chunk.
+        t->sims[m] = action_counts[a];
+        t->sims_remaining[m] = action_counts[a];
+        assert(*(t->new_stack_size) >= 0 && *(t->new_stack_size) < capacity);
+        t->new_stack[*(t->new_stack_size)] = m;
+        t->new_stack_size[0]++;
+      }
     }
   }
 

@@ -32,13 +32,16 @@
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
+#include <limits>
 #include <mutex>
+#include <fstream>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <iostream>
 
 #include "chess/gamestate.h"
 #include "chess/uciloop.h"
@@ -92,14 +95,53 @@ class RmctsSearch : public SearchBase {
   ~RmctsSearch() override {
     stop_requested_.store(true, std::memory_order_relaxed);
     JoinWorker();
+    PrintAndResetReuseGameSummary("shutdown");
   }
 
   void SetPosition(const GameState& game_state) final { game_state_ = game_state; }
 
   void NewGame() final {
     JoinWorker();
+    PrintAndResetReuseGameSummary("ucinewgame");
+    ClearPersistentTree();
     if (!options_->Get<bool>(kRmctsPrewarmOnNewGameId)) return;
     TryPrewarmBackend(GameState{});
+  }
+
+  void PrintAndResetReuseGameSummary(const char* reason) {
+    if (reuse_game_searches_ == 0) return;
+    const double branch_avg_pct =
+        (reuse_game_branch_ratio_count_ > 0)
+            ? (100.0 * reuse_game_branch_ratio_sum_ /
+               static_cast<double>(reuse_game_branch_ratio_count_))
+            : 0.0;
+    const double branch_weighted_pct =
+        (reuse_game_branch_old_rows_sum_ > 0.0)
+            ? (100.0 * reuse_game_branch_new_rows_sum_ /
+               reuse_game_branch_old_rows_sum_)
+            : 0.0;
+    std::cerr << "RMCTS_REUSE_SUMMARY reason=" << reason
+              << " searches=" << reuse_game_searches_
+              << " exact=" << reuse_game_exact_hits_
+              << " branch=" << reuse_game_branch_hits_
+              << " reset=" << reuse_game_resets_;
+    if (reuse_game_branch_ratio_count_ > 0) {
+      std::cerr << std::fixed << std::setprecision(1)
+                << " branch_retain_avg_pct=" << branch_avg_pct
+                << " branch_retain_weighted_pct=" << branch_weighted_pct
+                << " branch_rows_old_sum=" << reuse_game_branch_old_rows_sum_
+                << " branch_rows_new_sum=" << reuse_game_branch_new_rows_sum_
+                << std::defaultfloat;
+    }
+    std::cerr << '\n';
+    reuse_game_searches_ = 0;
+    reuse_game_exact_hits_ = 0;
+    reuse_game_branch_hits_ = 0;
+    reuse_game_resets_ = 0;
+    reuse_game_branch_ratio_sum_ = 0.0;
+    reuse_game_branch_ratio_count_ = 0;
+    reuse_game_branch_old_rows_sum_ = 0.0;
+    reuse_game_branch_new_rows_sum_ = 0.0;
   }
 
   void StartSearch(const GoParams& go_params) final {
@@ -238,6 +280,13 @@ class RmctsSearch : public SearchBase {
     for (float& p : *pi) p /= sum;
   }
 
+  static void NormalizePolicyRow(float* row_policy, int n) {
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) sum += row_policy[i];
+    if (!(sum > 0.0f) || !std::isfinite(sum)) return;
+    for (int i = 0; i < n; ++i) row_policy[i] /= sum;
+  }
+
   static std::vector<std::pair<uint16_t, float>> DenseToSparse(
       const std::vector<float>& dense) {
     std::vector<std::pair<uint16_t, float>> sparse;
@@ -269,11 +318,63 @@ class RmctsSearch : public SearchBase {
     }
   }
 
-  void EvaluateRows(const std::vector<int32_t>& rows, int gamesize,
-                    int n, std::vector<float>* G, std::vector<float>* policy,
+  static std::string EscapeCsv(const std::string& text) {
+    if (text.find_first_of(",\"\n") == std::string::npos) return text;
+    std::string out;
+    out.reserve(text.size() + 8);
+    out.push_back('"');
+    for (char c : text) {
+      if (c == '"') out.push_back('"');
+      out.push_back(c);
+    }
+    out.push_back('"');
+    return out;
+  }
+
+  void AppendChunkTraceCsv(int chunk_idx, const Position& root_pos,
+                           const std::vector<float>& root_prior,
+                           const std::vector<float>& posterior,
+                           const std::vector<float>& root_q,
+                           const std::vector<float>& root_n) const {
+    const char* trace_path = std::getenv("RMCTS_TRACE_CSV");
+    if (!trace_path || !trace_path[0]) return;
+
+    const bool write_header = (chunk_idx == 0);
+    std::ofstream out(trace_path, write_header ? std::ios::out : std::ios::app);
+    if (!out.is_open()) return;
+
+    if (write_header) {
+      out << "chunk,fen,move,prior,posterior,q,n_total\n";
+    }
+
+    const MoveList legal_moves = root_pos.GetBoard().GenerateLegalMoves();
+    for (const Move move : legal_moves) {
+      const int idx = MoveToNNIndex(move, 0);
+      Move display_move = move;
+      if (root_pos.IsBlackToMove()) {
+        display_move.Flip();
+      }
+      out << chunk_idx << ','
+          << EscapeCsv(PositionToFen(root_pos)) << ','
+          << display_move.ToString(false) << ','
+          << std::fixed << std::setprecision(6)
+          << std::max(0.0f, root_prior[idx]) << ','
+          << std::max(0.0f, posterior[idx]) << ','
+          << root_q[idx] << ','
+          << std::max(0.0f, root_n[idx]) << '\n';
+    }
+  }
+
+  void EvaluateRows(const std::vector<int32_t>& rows, int n,
+                    std::vector<rmcts::GameStateHandle>* state_handles,
+                    std::vector<float>* policy,
                     std::vector<float>* value,
                     std::unordered_map<std::string, CachedEval>* eval_cache,
                     int* expensive_events_remaining) {
+    // For each requested row:
+    // - reuse cached eval when available,
+    // - otherwise run backend eval if budget remains,
+    // - otherwise fall back to uniform over legal moves.
     std::vector<std::vector<Position>> positions_storage;
     positions_storage.reserve(rows.size());
     std::vector<MoveList> legal_moves_storage;
@@ -286,7 +387,7 @@ class RmctsSearch : public SearchBase {
 
     for (size_t sample = 0; sample < rows.size(); ++sample) {
       const int32_t row = rows[sample];
-      const int handle = rmcts::DecodeHandle(G->data() + row * gamesize);
+      const int handle = state_handles->at(row);
       const GameState& state = rmcts::GetStateByHandle(handle);
       state_keys[sample] = StateKey(state);
       positions_storage.emplace_back(state.GetPositions());
@@ -335,10 +436,238 @@ class RmctsSearch : public SearchBase {
     }
   }
 
+  void ClearPersistentTree() {
+    has_persistent_tree_ = false;
+    current_root_key_.clear();
+    eval_cache_.clear();
+    state_handles_.clear();
+    policy_.clear();
+    value_.clear();
+    Q_.clear();
+    N_.clear();
+    child_.clear();
+    parent_.clear();
+    a0_.clear();
+    sims_.clear();
+    sims_remaining_.clear();
+    inference_stack_.clear();
+    new_stack_.clear();
+    capacity_ = 0;
+    row_count_ = 0;
+  }
+
+  void EnsurePersistentCapacity(int required_rows, int n) {
+    if (required_rows <= capacity_) return;
+    int new_capacity = std::max(2, capacity_);
+    while (new_capacity < required_rows) new_capacity *= 2;
+
+    state_handles_.resize(new_capacity, 0);
+    policy_.resize(new_capacity * n, 0.0f);
+    value_.resize(new_capacity, 0.0f);
+    Q_.resize(new_capacity * n, 0.0f);
+    N_.resize(new_capacity * n, 0.0f);
+    child_.resize(new_capacity * n, -1);
+    parent_.resize(new_capacity, 0);
+    a0_.resize(new_capacity, 0);
+    sims_.resize(new_capacity, 0);
+    sims_remaining_.resize(new_capacity, 0);
+    inference_stack_.resize(new_capacity, 0);
+    new_stack_.resize(new_capacity, 0);
+    capacity_ = new_capacity;
+  }
+
+  void ResetPersistentTree(const GameState& root_state, int initial_capacity,
+                           int n) {
+    rmcts::InitializeRootState(root_state);
+
+    capacity_ = std::max(2, initial_capacity);
+    state_handles_.assign(capacity_, 0);
+    policy_.assign(capacity_ * n, 0.0f);
+    value_.assign(capacity_, 0.0f);
+    Q_.assign(capacity_ * n, 0.0f);
+    N_.assign(capacity_ * n, 0.0f);
+    child_.assign(capacity_ * n, -1);
+    parent_.assign(capacity_, 0);
+    a0_.assign(capacity_, 0);
+    sims_.assign(capacity_, 0);
+    sims_remaining_.assign(capacity_, 0);
+    inference_stack_.assign(capacity_, 0);
+    new_stack_.assign(capacity_, 0);
+
+    row_count_ = 1;
+    state_handles_[0] = rmcts::RootHandle();
+    parent_[0] = -1;
+    a0_[0] = -1;
+
+    current_root_state_ = root_state;
+    current_root_key_ = StateKey(root_state);
+    eval_cache_.clear();
+    has_persistent_tree_ = true;
+  }
+
+  bool RestrictToBranch(int action_id, const GameState& new_root_state, int n) {
+    if (!has_persistent_tree_ || row_count_ <= 0) return false;
+    if (action_id < 0 || action_id >= n) return false;
+
+    const int32_t old_total_rows = row_count_;
+
+    const int32_t old_root_child = child_[action_id];
+    if (old_root_child < 0 || old_root_child >= row_count_) return false;
+
+    std::vector<int32_t> order;
+    order.reserve(row_count_);
+    std::unordered_map<int32_t, int32_t> remap;
+    remap.reserve(static_cast<size_t>(row_count_));
+    std::vector<int32_t> stack;
+    stack.push_back(old_root_child);
+
+    while (!stack.empty()) {
+      const int32_t old_row = stack.back();
+      stack.pop_back();
+      if (old_row < 0 || old_row >= row_count_) continue;
+      if (remap.find(old_row) != remap.end()) continue;
+      const int32_t new_row = static_cast<int32_t>(order.size());
+      remap.emplace(old_row, new_row);
+      order.push_back(old_row);
+
+      const int base = old_row * n;
+      for (int a = 0; a < n; ++a) {
+        const int32_t c = child_[base + a];
+        if (c >= 0 && c < row_count_ && remap.find(c) == remap.end()) {
+          stack.push_back(c);
+        }
+      }
+    }
+
+    if (order.empty()) return false;
+
+    const int32_t new_row_count = static_cast<int32_t>(order.size());
+    const int new_capacity = std::max(capacity_, std::max(2, new_row_count * 2));
+
+    std::vector<rmcts::GameStateHandle> state_handles_new(new_capacity, 0);
+    std::vector<float> policy_new(new_capacity * n, 0.0f);
+    std::vector<float> value_new(new_capacity, 0.0f);
+    std::vector<float> Q_new(new_capacity * n, 0.0f);
+    std::vector<float> N_new(new_capacity * n, 0.0f);
+    std::vector<int32_t> child_new(new_capacity * n, -1);
+    std::vector<int32_t> parent_new(new_capacity, 0);
+    std::vector<int32_t> a0_new(new_capacity, 0);
+    std::vector<int32_t> sims_new(new_capacity, 0);
+    std::vector<int32_t> sims_remaining_new(new_capacity, 0);
+    std::vector<int32_t> inference_stack_new(new_capacity, 0);
+    std::vector<int32_t> new_stack_new(new_capacity, 0);
+
+    for (int32_t new_row = 0; new_row < new_row_count; ++new_row) {
+      const int32_t old_row = order[new_row];
+      state_handles_new[new_row] = state_handles_[old_row];
+      value_new[new_row] = value_[old_row];
+      sims_new[new_row] = sims_[old_row];
+      sims_remaining_new[new_row] = sims_remaining_[old_row];
+
+      std::copy_n(policy_.begin() + old_row * n, n,
+                  policy_new.begin() + new_row * n);
+      std::copy_n(Q_.begin() + old_row * n, n, Q_new.begin() + new_row * n);
+      std::copy_n(N_.begin() + old_row * n, n, N_new.begin() + new_row * n);
+
+      const int32_t old_parent = parent_[old_row];
+      const auto p_it = remap.find(old_parent);
+      parent_new[new_row] = (p_it != remap.end()) ? p_it->second : -1;
+      a0_new[new_row] = a0_[old_row];
+
+      for (int a = 0; a < n; ++a) {
+        const int32_t old_child = child_[old_row * n + a];
+        const auto c_it = remap.find(old_child);
+        child_new[new_row * n + a] =
+            (c_it != remap.end()) ? c_it->second : -1;
+      }
+    }
+
+    parent_new[0] = -1;
+    a0_new[0] = -1;
+
+    state_handles_.swap(state_handles_new);
+    policy_.swap(policy_new);
+    value_.swap(value_new);
+    Q_.swap(Q_new);
+    N_.swap(N_new);
+    child_.swap(child_new);
+    parent_.swap(parent_new);
+    a0_.swap(a0_new);
+    sims_.swap(sims_new);
+    sims_remaining_.swap(sims_remaining_new);
+    inference_stack_.swap(inference_stack_new);
+    new_stack_.swap(new_stack_new);
+    capacity_ = new_capacity;
+    row_count_ = new_row_count;
+
+    current_root_state_ = new_root_state;
+    current_root_key_ = StateKey(new_root_state);
+
+    last_restrict_action_id_ = action_id;
+    last_restrict_old_rows_ = old_total_rows;
+    last_restrict_new_rows_ = new_row_count;
+    return true;
+  }
+
+  enum class ReuseKind {
+    kReset,
+    kExact,
+    kBranch,
+  };
+
+  struct ReuseInfo {
+    ReuseKind kind = ReuseKind::kReset;
+    int action_id = -1;
+    int32_t old_rows = 0;
+    int32_t new_rows = 0;
+    int steps = 0;
+  };
+
+  ReuseInfo TryReuseForRoot(const GameState& new_root_state, int n) {
+    ReuseInfo info;
+    if (!has_persistent_tree_ || row_count_ <= 0) return info;
+
+    const std::string next_key = StateKey(new_root_state);
+    if (next_key == current_root_key_) {
+      info.kind = ReuseKind::kExact;
+      info.old_rows = row_count_;
+      info.new_rows = row_count_;
+      return info;
+    }
+
+    const auto& old_moves = current_root_state_.moves;
+    const auto& new_moves = new_root_state.moves;
+    if (new_moves.size() < old_moves.size()) return info;
+    if (!std::equal(old_moves.begin(), old_moves.end(), new_moves.begin())) {
+      return info;
+    }
+
+    if (new_moves.size() == old_moves.size()) {
+      return info;
+    }
+
+    GameState rolling_state = current_root_state_;
+    const int32_t initial_rows = row_count_;
+    for (size_t i = old_moves.size(); i < new_moves.size(); ++i) {
+      const Move step_move = new_moves[i];
+      const int action_id = MoveToNNIndex(step_move, 0);
+      rolling_state.moves.push_back(step_move);
+      if (!RestrictToBranch(action_id, rolling_state, n)) {
+        return ReuseInfo{};
+      }
+      info.steps++;
+      info.action_id = action_id;
+    }
+
+    info.kind = ReuseKind::kBranch;
+    info.old_rows = initial_rows;
+    info.new_rows = row_count_;
+    return info;
+  }
+
   RmctsRunResult RunRmcts(const GameState& game_state, const GoParams& go_params) {
     const auto search_start = std::chrono::steady_clock::now();
     constexpr int kNumLanes = 1;
-    constexpr int gamesize = rmcts::kEncodedStateSize;
     constexpr int n = rmcts::kPolicySize;
 
     const int num_sims = std::max(1, options_->Get<int>(kRmctsNumSimsId));
@@ -347,115 +676,165 @@ class RmctsSearch : public SearchBase {
     const int epochs = std::max(1, options_->Get<int>(kRmctsEpochsId));
     const float posterior_weight = std::clamp(
         options_->Get<float>(kRmctsPosteriorWeightId), 0.0f, 1.0f);
-    const int effective_epochs = std::max(epochs, (num_sims + chunk_sims - 1) / chunk_sims);
-    const int epoch_sims = std::max(1, (num_sims + effective_epochs - 1) / effective_epochs);
-    const int capacity = kNumLanes * epoch_sims;
-    int expensive_events_remaining = num_sims;
+    const auto budget_ms = ComputeTimeBudgetMs(go_params, game_state);
+    const bool time_limited = budget_ms.has_value();
+
+    const int effective_epochs =
+      time_limited
+        ? std::numeric_limits<int>::max()
+        : std::max(epochs, (num_sims + chunk_sims - 1) / chunk_sims);
+    const int epoch_sims =
+      time_limited
+        ? chunk_sims
+        : std::max(1, (num_sims + effective_epochs - 1) / effective_epochs);
+    const int total_sims_budget = std::max(num_sims, chunk_sims);
+    const int initial_capacity =
+        2 * kNumLanes * std::max(1, total_sims_budget);
+    int expensive_events_remaining =
+      time_limited ? std::numeric_limits<int>::max() / 4 : num_sims;
     int sims_remaining_global = num_sims;
 
-    const auto budget_ms = ComputeTimeBudgetMs(go_params, game_state);
     const auto deadline = budget_ms
                               ? std::optional<std::chrono::steady_clock::time_point>(
                                     search_start + std::chrono::milliseconds(*budget_ms))
                               : std::nullopt;
 
-    std::unordered_map<std::string, CachedEval> eval_cache;
     std::vector<float> root_posterior_running(n, 0.0f);
     std::vector<float> root_prior(n, 0.0f);
     std::vector<float> final_root_policy(n, 0.0f);
+    std::vector<float> final_root_q(n, 0.0f);
+    std::vector<float> final_root_n(n, 0.0f);
     float final_root_value = 0.0f;
 
-    rmcts::InitializeRootState(game_state);
+    const ReuseInfo reuse_info = TryReuseForRoot(game_state, n);
+    ++reuse_game_searches_;
+    if (reuse_info.kind == ReuseKind::kReset) {
+      ResetPersistentTree(game_state, initial_capacity, n);
+      ++reuse_resets_;
+      ++reuse_game_resets_;
+    } else if (reuse_info.kind == ReuseKind::kBranch) {
+      ++reuse_branch_hits_;
+      ++reuse_game_branch_hits_;
+      if (reuse_info.old_rows > 0) {
+        const double ratio = static_cast<double>(reuse_info.new_rows) /
+                             static_cast<double>(reuse_info.old_rows);
+        reuse_game_branch_ratio_sum_ += ratio;
+        ++reuse_game_branch_ratio_count_;
+        reuse_game_branch_old_rows_sum_ +=
+            static_cast<double>(reuse_info.old_rows);
+        reuse_game_branch_new_rows_sum_ +=
+            static_cast<double>(reuse_info.new_rows);
+      }
+    } else {
+      ++reuse_exact_hits_;
+      ++reuse_game_exact_hits_;
+      EnsurePersistentCapacity(
+          row_count_ + 2 * std::max(1, std::max(chunk_sims, epoch_sims)), n);
+    }
+
     const std::string root_key = StateKey(game_state);
 
     int completed_epochs = 0;
+    int64_t total_completed_sims = 0;
     int32_t last_total_sims = 0;
-    for (int epoch = 0; epoch < effective_epochs && sims_remaining_global > 0;
+    for (int epoch = 0;
+         epoch < effective_epochs && (time_limited || sims_remaining_global > 0);
          ++epoch) {
       if (stop_requested_.load(std::memory_order_relaxed) ||
           DeadlineReached(deadline)) {
         break;
       }
 
-      const int this_epoch_sims = std::min(epoch_sims, sims_remaining_global);
-      sims_remaining_global -= this_epoch_sims;
+      const int this_epoch_sims =
+          time_limited ? epoch_sims : std::min(epoch_sims, sims_remaining_global);
+      if (!time_limited) sims_remaining_global -= this_epoch_sims;
+
+        // Worst-case growth per chunk is proportional to chunk sims.
+        // Grow buffers ahead of this epoch when needed.
+        EnsurePersistentCapacity(row_count_ + 2 * std::max(1, this_epoch_sims),
+                                n);
+
       std::vector<float> new_policy(kNumLanes * n, 0.0f);
       std::vector<float> new_value(kNumLanes, 0.0f);
-      std::vector<float> G(capacity * gamesize, 0.0f);
-      std::vector<float> policy(capacity * n, 0.0f);
-      std::vector<float> value(capacity, 0.0f);
-      std::vector<float> Q(capacity * n, 0.0f);
-      std::vector<float> N(capacity * n, 0.0f);
 
-      std::vector<int32_t> parent(capacity, 0);
-      std::vector<int32_t> a0(capacity, 0);
-      std::vector<int32_t> sims(capacity, 0);
-      std::vector<int32_t> sims_remaining(capacity, 0);
-      std::vector<int32_t> inference_stack(capacity, 0);
-      int32_t inference_stack_size = 0;
-      std::vector<int32_t> new_stack(capacity, 0);
-      int32_t new_stack_size = 0;
-      int32_t num_completed = 0;
-      int32_t row_count = 1;
+        inference_stack_size_ = 0;
+        new_stack_size_ = 0;
+        num_completed_ = 0;
+      sims_[0] = this_epoch_sims;
+      sims_remaining_[0] = this_epoch_sims;
 
-      G[0] = 0.0f;
-      parent[0] = -1;
-      a0[0] = -1;
-      sims[0] = this_epoch_sims;
-      sims_remaining[0] = this_epoch_sims;
-
-      EvaluateRows({0}, gamesize, n, &G, &policy, &value, &eval_cache,
+      EvaluateRows({0}, n, &state_handles_, &policy_, &value_, &eval_cache_,
                    &expensive_events_remaining);
 
       if (epoch == 0) {
-        for (int i = 0; i < n; ++i) root_prior[i] = policy[i];
+        for (int i = 0; i < n; ++i) root_prior[i] = policy_[i];
+        // Keep a valid fallback posterior from the first evaluated root prior.
+        final_root_policy = root_prior;
+        NormalizePolicy(&final_root_policy);
       }
 
       if (epoch > 0) {
-        auto it = eval_cache.find(root_key);
-        if (it != eval_cache.end()) {
+        auto it = eval_cache_.find(root_key);
+        if (it != eval_cache_.end()) {
+          // Re-seed the root prior using current-network prior blended with the
+          // running posterior from previous epochs.
           std::vector<float> root_prior(n, 0.0f);
           FillRowFromSparse(it->second.sparse_policy, n, root_prior.data());
           for (int i = 0; i < n; ++i) {
-            policy[i] = (1.0f - posterior_weight) * root_prior[i] +
-                        posterior_weight * root_posterior_running[i];
+            policy_[i] = (1.0f - posterior_weight) * root_prior[i] +
+                         posterior_weight * root_posterior_running[i];
           }
-          NormalizePolicy(&policy);
+          NormalizePolicyRow(policy_.data(), n);
         }
       }
 
-      new_stack[0] = 0;
-      new_stack_size = 1;
+      new_stack_[0] = 0;
+      new_stack_size_ = 1;
 
-      void* mcts = MCTS_init(kNumLanes, epoch_sims, c_puct, new_policy.data(),
-                             new_value.data(), G.data(), policy.data(),
-                             value.data(), Q.data(), N.data(), parent.data(),
-                             a0.data(), sims.data(), sims_remaining.data(),
-                             inference_stack.data(), &inference_stack_size,
-                             new_stack.data(), &new_stack_size, &num_completed,
-                             &row_count);
+      void* mcts = MCTS_init(kNumLanes, capacity_ / kNumLanes, c_puct,
+                             new_policy.data(), new_value.data(),
+                             state_handles_.data(), policy_.data(), value_.data(),
+                             Q_.data(), N_.data(), child_.data(), parent_.data(),
+                             a0_.data(), sims_.data(), sims_remaining_.data(),
+                             inference_stack_.data(), &inference_stack_size_,
+                             new_stack_.data(), &new_stack_size_, &num_completed_,
+                             &row_count_);
 
-      while (num_completed < kNumLanes) {
+      while (num_completed_ < kNumLanes) {
         if (stop_requested_.load(std::memory_order_relaxed) ||
             DeadlineReached(deadline)) {
           break;
         }
         MCTS_flush_new_stack(mcts);
-        if (inference_stack_size == 0) break;
-        std::vector<int32_t> rows(inference_stack.begin(),
-                                  inference_stack.begin() + inference_stack_size);
-        inference_stack_size = 0;
-        EvaluateRows(rows, gamesize, n, &G, &policy, &value, &eval_cache,
+        if (inference_stack_size_ == 0) break;
+        std::vector<int32_t> rows(inference_stack_.begin(),
+                                  inference_stack_.begin() + inference_stack_size_);
+        inference_stack_size_ = 0;
+        EvaluateRows(rows, n, &state_handles_, &policy_, &value_, &eval_cache_,
                      &expensive_events_remaining);
         for (const int32_t row : rows) {
-          new_stack[new_stack_size++] = row;
+          new_stack_[new_stack_size_++] = row;
         }
       }
 
       MCTS_free(mcts);
 
-      last_total_sims = sims[0] - sims_remaining[0];
+      last_total_sims = sims_[0] - sims_remaining_[0];
       if (last_total_sims <= 0) break;
+      total_completed_sims += last_total_sims;
+
+      float new_policy_sum = 0.0f;
+      for (const float p : new_policy) new_policy_sum += p;
+      const bool has_valid_posterior =
+          std::isfinite(new_policy_sum) && new_policy_sum > 0.0f;
+      if (!has_valid_posterior) {
+        // Deadline/stop can interrupt before root posterior finalization.
+        // Keep the last valid posterior instead of replacing it with zeros.
+        continue;
+      }
+
+      std::copy(Q_.begin(), Q_.begin() + n, final_root_q.begin());
+      std::copy(N_.begin(), N_.begin() + n, final_root_n.begin());
 
       ++completed_epochs;
       for (int i = 0; i < n; ++i) {
@@ -468,6 +847,10 @@ class RmctsSearch : public SearchBase {
 
       final_root_policy = new_policy;
       final_root_value = new_value[0];
+
+      AppendChunkTraceCsv(completed_epochs - 1, game_state.CurrentPosition(),
+              root_prior, final_root_policy, final_root_q,
+              final_root_n);
 
       {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -492,11 +875,21 @@ class RmctsSearch : public SearchBase {
     std::vector<ThinkingInfo> policy_infos;
     policy_infos.reserve(legal_moves.size());
 
+    float posterior_sum = 0.0f;
+    for (const float p : final_root_policy) posterior_sum += p;
+    if (!(posterior_sum > 0.0f) || !std::isfinite(posterior_sum)) {
+      final_root_policy = root_prior;
+      NormalizePolicy(&final_root_policy);
+    }
+
     struct Row {
       Move move;
+      int action_id;
       float prior;
       float posterior;
       int visits;
+      float q;
+      float root_n;
     };
     std::vector<Row> rows;
     rows.reserve(legal_moves.size());
@@ -505,8 +898,10 @@ class RmctsSearch : public SearchBase {
     for (const Move move : legal_moves) {
       const int idx = MoveToNNIndex(move, 0);
       const float p = std::max(0.0f, final_root_policy[idx]);
-      const int visits = static_cast<int>(std::round(p * std::max<int64_t>(1, num_sims)));
-      rows.push_back(Row{move, std::max(0.0f, root_prior[idx]), p, visits});
+        const int visits =
+          static_cast<int>(std::lround(std::max(0.0f, final_root_n[idx])));
+      rows.push_back(Row{move, idx, std::max(0.0f, root_prior[idx]), p, visits,
+           final_root_q[idx], final_root_n[idx]});
       total_visits += visits;
     }
 
@@ -520,7 +915,13 @@ class RmctsSearch : public SearchBase {
       oss << row.move.ToString(false)
           << " N: " << row.visits
           << " (P: " << std::fixed << std::setprecision(2)
-          << row.prior * 100.0f << "%)";
+          << row.prior * 100.0f << "%)"
+          << " Post: " << std::fixed << std::setprecision(2)
+          << row.posterior * 100.0f << "%"
+          << " Q: " << std::fixed << std::setprecision(3)
+          << row.q
+          << " A: " << row.action_id
+          << " RN: " << static_cast<int>(std::lround(row.root_n));
       policy_infos.push_back(ThinkingInfo{.comment = oss.str()});
     }
 
@@ -542,8 +943,7 @@ class RmctsSearch : public SearchBase {
             std::chrono::steady_clock::now() - search_start)
             .count());
 
-    return RmctsRunResult{best_move, final_root_value,
-                          static_cast<int64_t>(num_sims - expensive_events_remaining),
+    return RmctsRunResult{best_move, final_root_value, total_completed_sims,
                           elapsed_ms, std::move(policy_infos)};
   }
 
@@ -581,6 +981,44 @@ class RmctsSearch : public SearchBase {
   const OptionsDict* options_ = nullptr;
   GameState game_state_;
   Move bestmove_;
+
+  bool has_persistent_tree_ = false;
+  std::string current_root_key_;
+  GameState current_root_state_;
+  std::unordered_map<std::string, CachedEval> eval_cache_;
+
+  int capacity_ = 0;
+  int32_t row_count_ = 0;
+  std::vector<rmcts::GameStateHandle> state_handles_;
+  std::vector<float> policy_;
+  std::vector<float> value_;
+  std::vector<float> Q_;
+  std::vector<float> N_;
+  std::vector<int32_t> child_;
+  std::vector<int32_t> parent_;
+  std::vector<int32_t> a0_;
+  std::vector<int32_t> sims_;
+  std::vector<int32_t> sims_remaining_;
+  std::vector<int32_t> inference_stack_;
+  int32_t inference_stack_size_ = 0;
+  std::vector<int32_t> new_stack_;
+  int32_t new_stack_size_ = 0;
+  int32_t num_completed_ = 0;
+
+  int64_t reuse_exact_hits_ = 0;
+  int64_t reuse_branch_hits_ = 0;
+  int64_t reuse_resets_ = 0;
+  int64_t reuse_game_searches_ = 0;
+  int64_t reuse_game_exact_hits_ = 0;
+  int64_t reuse_game_branch_hits_ = 0;
+  int64_t reuse_game_resets_ = 0;
+  double reuse_game_branch_ratio_sum_ = 0.0;
+  int64_t reuse_game_branch_ratio_count_ = 0;
+  double reuse_game_branch_old_rows_sum_ = 0.0;
+  double reuse_game_branch_new_rows_sum_ = 0.0;
+  int last_restrict_action_id_ = -1;
+  int32_t last_restrict_old_rows_ = 0;
+  int32_t last_restrict_new_rows_ = 0;
 };
 
 class RmctsFactory : public SearchFactory {

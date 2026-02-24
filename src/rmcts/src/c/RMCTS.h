@@ -1,9 +1,11 @@
+#pragma once
+
 #include <stdint.h>
 #include <math.h>
 
-// #include "dict32.h"
+#include "game.h"
 
-void select_chunksizes(int* chunksizes, int budget, float* pi, int n);
+void assign_simulations(int* sims_per_action, int budget, float* pi, int n);
 void new_policy_common_ucb_Newton(float* pi1, int n, float* Q, float c, float* pi0, int T);
 
 typedef struct {
@@ -14,11 +16,12 @@ typedef struct {
 	float* new_policy;
 	float* new_value;	
 	
-	float* G; //game state
+	GameStateHandle* G;
 	float* policy;
 	float* value;
 	float* Q;
 	float* N;
+	int32_t* child;
 	int32_t* parent;
 	int32_t* a0;
 	int32_t* sims;
@@ -31,18 +34,19 @@ typedef struct {
 	int32_t* row_count;
 } MCTS_new_t;
 
-// all the array data is allocated in python
-// partly because we want to see this data in python
+// Caller-owned scratch/state buffers. The RMCTS core stores pointers to these
+// arrays and mutates them in place.
 void* MCTS_init(int const num_lanes,  
 				int const numSims,
 				float const c_puct,
 				float* new_policy,
 				float* new_value,
-				float* G,
+				GameStateHandle* G,
 				float* policy,
 				float* value,
 				float* Q,
 				float* N,
+				int32_t* child,
 				int32_t* parent,
 				int32_t* a0,
 				int32_t* sims,
@@ -58,8 +62,7 @@ void* MCTS_init(int const num_lanes,
 void MCTS_free(void* mcts);
 
 
-// completely flushes the new_stack
-// and populates the inference_stack with whatever inferences are required
+// Drains new_stack and appends newly discovered rows to inference_stack.
 void MCTS_flush_new_stack(void* const mcts);
 
 

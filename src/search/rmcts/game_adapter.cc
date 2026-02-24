@@ -4,14 +4,17 @@
 #include <cstdio>
 #include <vector>
 
+#include "rmcts/src/c/game.h"
 #include "neural/encoder.h"
 
 namespace lczero::rmcts {
 namespace {
 
+// State arena indexed by GameStateHandle. Handles remain stable for the
+// lifetime of a single search and are reset by InitializeRootState().
 struct AdapterStore {
   std::vector<GameState> states;
-  int root_handle = 0;
+  GameStateHandle root_handle = 0;
 };
 
 AdapterStore& Store() {
@@ -32,11 +35,11 @@ void InitializeRootState(const GameState& root_state) {
   store.root_handle = 0;
 }
 
-int DecodeHandle(const float* g) {
-  return static_cast<int>(g[0]);
+GameStateHandle RootHandle() {
+  return Store().root_handle;
 }
 
-const GameState& GetStateByHandle(int handle) {
+const GameState& GetStateByHandle(GameStateHandle handle) {
   const auto& store = Store();
   assert(handle >= 0 && handle < static_cast<int>(store.states.size()));
   return store.states[handle];
@@ -60,13 +63,13 @@ std::optional<Move> FindMoveForAction(const GameState& state, int action_id) {
   return std::nullopt;
 }
 
-int CreateChildState(int parent_handle, Move move) {
+GameStateHandle CreateChildState(GameStateHandle parent_handle, Move move) {
   auto& store = Store();
   assert(parent_handle >= 0 && parent_handle < static_cast<int>(store.states.size()));
   GameState child = store.states[parent_handle];
   child.moves.push_back(move);
   store.states.push_back(std::move(child));
-  return static_cast<int>(store.states.size()) - 1;
+  return static_cast<GameStateHandle>(store.states.size() - 1);
 }
 
 float ScoreFromWhitePerspective(GameResult result) {
@@ -77,29 +80,20 @@ float ScoreFromWhitePerspective(GameResult result) {
 
 }  // namespace lczero::rmcts
 
+// C callback bridge consumed by rmcts/src/c/*.cc.
 int numActions(void) { return lczero::rmcts::kPolicySize; }
 
-int gameLength(void) { return lczero::rmcts::kEncodedStateSize; }
-
-int inputLength(void) { return lczero::rmcts::kEncodedStateSize; }
-
-void rootState(float* const g) {
-  g[0] = 0.0f;
+::GameStateHandle rootState(void) {
+  return lczero::rmcts::RootHandle();
 }
 
-float playerId(const float* const g) {
-  const int handle = lczero::rmcts::DecodeHandle(g);
-  const auto& state = lczero::rmcts::GetStateByHandle(handle);
+float playerId(::GameStateHandle state_handle) {
+  const auto& state = lczero::rmcts::GetStateByHandle(state_handle);
   return state.CurrentPosition().IsBlackToMove() ? -1.0f : 1.0f;
 }
 
-void inputNetwork(float* const x, const float* const g) {
-  x[0] = g[0];
-}
-
-int gameEnded(float* const terminal_score, const float* const g) {
-  const int handle = lczero::rmcts::DecodeHandle(g);
-  const auto& state = lczero::rmcts::GetStateByHandle(handle);
+int gameEnded(float* const terminal_score, ::GameStateHandle state_handle) {
+  const auto& state = lczero::rmcts::GetStateByHandle(state_handle);
   lczero::PositionHistory history(state.GetPositions());
   const lczero::GameResult result = history.ComputeGameResult();
   if (result == lczero::GameResult::UNDECIDED) {
@@ -110,15 +104,13 @@ int gameEnded(float* const terminal_score, const float* const g) {
   return 1;
 }
 
-int isValidAction(const float* const g, int const a) {
-  const int handle = lczero::rmcts::DecodeHandle(g);
-  const auto& state = lczero::rmcts::GetStateByHandle(handle);
+int isValidAction(::GameStateHandle state_handle, int const a) {
+  const auto& state = lczero::rmcts::GetStateByHandle(state_handle);
   return lczero::rmcts::FindMoveForAction(state, a).has_value() ? 1 : 0;
 }
 
-int getValidActions(int* const actions, const float* const g) {
-  const int handle = lczero::rmcts::DecodeHandle(g);
-  const auto& state = lczero::rmcts::GetStateByHandle(handle);
+int getValidActions(int* const actions, ::GameStateHandle state_handle) {
+  const auto& state = lczero::rmcts::GetStateByHandle(state_handle);
   const auto ids = lczero::rmcts::GetValidActionIds(state);
   for (size_t i = 0; i < ids.size(); ++i) {
     actions[i] = ids[i];
@@ -126,19 +118,19 @@ int getValidActions(int* const actions, const float* const g) {
   return static_cast<int>(ids.size());
 }
 
-int nextState(float* const ga, const float* const g, const int a) {
-  const int handle = lczero::rmcts::DecodeHandle(g);
-  const auto& state = lczero::rmcts::GetStateByHandle(handle);
+int nextState(::GameStateHandle* const child_state, ::GameStateHandle state_handle,
+              const int a) {
+  const auto& state = lczero::rmcts::GetStateByHandle(state_handle);
   const auto move = lczero::rmcts::FindMoveForAction(state, a);
   if (!move.has_value()) return -1;
-  const int child_handle = lczero::rmcts::CreateChildState(handle, *move);
-  ga[0] = static_cast<float>(child_handle);
+  const GameStateHandle child_handle =
+      lczero::rmcts::CreateChildState(state_handle, *move);
+  *child_state = child_handle;
   float terminal_score = 0.0f;
-  return gameEnded(&terminal_score, ga);
+  return gameEnded(&terminal_score, child_handle);
 }
 
-void printGame(const float* const g) {
-  const int handle = lczero::rmcts::DecodeHandle(g);
-  const auto& state = lczero::rmcts::GetStateByHandle(handle);
+void printGame(::GameStateHandle state_handle) {
+  const auto& state = lczero::rmcts::GetStateByHandle(state_handle);
   std::printf("%s\n", PositionToFen(state.CurrentPosition()).c_str());
 }

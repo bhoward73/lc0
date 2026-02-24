@@ -1,38 +1,24 @@
-#include <stdlib.h>
+#pragma once
 
-// ELEVEN REQUIRED METHODS, GAME STATE IS AN ARRAY OF FLOATS (32bit) (1 DIML), DENOTED 'g' BELOW:
+#include <cstdint>
+
+// Opaque state id managed by the lc0 RMCTS adapter.
+using GameStateHandle = int32_t;
 
 int numActions(void);
 
-int gameLength(void); // was fullDim()
+GameStateHandle rootState(void);
 
-int inputLength(void);
+float playerId(GameStateHandle state);
 
-// copies root state of the game into memory at address g
-void rootState(float* const g);
+int gameEnded(float* const terminal_score, GameStateHandle state);
 
-// playerId returns identity of next player (+1.0 = first, -1.0 = second)
-float playerId(const float* const g);
+int isValidAction(GameStateHandle state, int const action);
 
-// moving this to an input layer for the network
-// writes input for network from game states g to x
-// x should be a flattened input for neural network 
-void inputNetwork(float* const x, const float* const g);
-//void inputNetwork(float* const X, const float* const G, const int num_games);
+int getValidActions(int* const actions, GameStateHandle state);
 
-// says whether game is ended, and also records terminal score
-// returns 1 if game is ended, 0 otherwise
-int gameEnded(float* const terminal_score, const float* const g);
+int nextState(GameStateHandle* const child_state, GameStateHandle state,
+			  int const action);
 
-// returns 1 if action is valid, 0 otherwise
-int isValidAction(const float* const g, int const a);
-
-// returns number of valid actions; populates actions with these
-int getValidActions(int* const actions, const float* const g);
-
-// records the next state of the game g given action a into ga.
-// Returns -1 if action=a is invalid. Returns 1 if ga is terminal, and 0 otherwise.
-int nextState(float* const ga, const float* const g, const int a);
-
-void printGame(const float* const g);
+void printGame(GameStateHandle state);
 

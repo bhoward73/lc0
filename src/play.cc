@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -154,6 +155,10 @@ class BestMoveCaptureResponder : public lczero::UciResponder {
         std::string move;
         std::uint32_t visits;
         double prior;
+        std::optional<double> posterior;
+        std::optional<double> q;
+        std::optional<int> action_id;
+        std::optional<int> root_n;
     };
 
     void OutputBestMove(lczero::BestMoveInfo* info) override {
@@ -277,6 +282,89 @@ class BestMoveCaptureResponder : public lczero::UciResponder {
         stat.move = move;
         stat.visits = static_cast<std::uint32_t>(std::stoul(line.substr(n_value_start, n_value_end - n_value_start)));
         stat.prior = std::stod(p_text) / 100.0;
+
+        const auto post_pos = line.find("Post:");
+        if (post_pos != std::string::npos) {
+            std::size_t post_value_start = post_pos + 5;
+            while (post_value_start < line.size() && line[post_value_start] == ' ') {
+                ++post_value_start;
+            }
+            const auto post_percent_pos = line.find('%', post_value_start);
+            if (post_percent_pos != std::string::npos) {
+                const std::string post_text =
+                    line.substr(post_value_start, post_percent_pos - post_value_start);
+                try {
+                    stat.posterior = std::stod(post_text) / 100.0;
+                } catch (const std::exception&) {
+                    stat.posterior.reset();
+                }
+            }
+        }
+
+        const auto q_pos = line.find("Q:");
+        if (q_pos != std::string::npos) {
+            std::size_t q_value_start = q_pos + 2;
+            while (q_value_start < line.size() && line[q_value_start] == ' ') {
+                ++q_value_start;
+            }
+            std::size_t q_value_end = q_value_start;
+            while (q_value_end < line.size()) {
+                const char c = line[q_value_end];
+                if (!(std::isdigit(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '+')) {
+                    break;
+                }
+                ++q_value_end;
+            }
+            if (q_value_end > q_value_start) {
+                try {
+                    stat.q = std::stod(line.substr(q_value_start, q_value_end - q_value_start));
+                } catch (const std::exception&) {
+                    stat.q.reset();
+                }
+            }
+        }
+
+        const auto a_pos = line.find("A:");
+        if (a_pos != std::string::npos) {
+            std::size_t a_value_start = a_pos + 2;
+            while (a_value_start < line.size() && line[a_value_start] == ' ') {
+                ++a_value_start;
+            }
+            std::size_t a_value_end = a_value_start;
+            while (a_value_end < line.size() &&
+                   std::isdigit(static_cast<unsigned char>(line[a_value_end]))) {
+                ++a_value_end;
+            }
+            if (a_value_end > a_value_start) {
+                try {
+                    stat.action_id = std::stoi(
+                        line.substr(a_value_start, a_value_end - a_value_start));
+                } catch (const std::exception&) {
+                    stat.action_id.reset();
+                }
+            }
+        }
+
+        const auto rn_pos = line.find("RN:");
+        if (rn_pos != std::string::npos) {
+            std::size_t rn_value_start = rn_pos + 3;
+            while (rn_value_start < line.size() && line[rn_value_start] == ' ') {
+                ++rn_value_start;
+            }
+            std::size_t rn_value_end = rn_value_start;
+            while (rn_value_end < line.size() &&
+                   std::isdigit(static_cast<unsigned char>(line[rn_value_end]))) {
+                ++rn_value_end;
+            }
+            if (rn_value_end > rn_value_start) {
+                try {
+                    stat.root_n = std::stoi(
+                        line.substr(rn_value_start, rn_value_end - rn_value_start));
+                } catch (const std::exception&) {
+                    stat.root_n.reset();
+                }
+            }
+        }
         return stat;
     }
 
@@ -344,13 +432,16 @@ void PrintHelp(const char* binary_name) {
               << "  --minibatch-size=N  Search minibatch size (0 = auto)\n"
               << "  --max-prefetch=N    Search prefetch batch size\n"
               << "  --max-half-moves=N  Stop after N half-moves (plies)\n"
-              << "  --human             Enable human-vs-bot mode\n"
+              << "  --human             Enable human-vs-human mode (manual moves for both sides)\n"
               << "  --no-pause          In bot mode, do not pause between moves\n\n"
               << "Notes:\n"
               << "  - Default search movetime is 300 ms per move.\n"
               << "  - Default move overhead is 0 ms in this app.\n"
-              << "  - In human mode, type moves in UCI format (e.g. e2e4, e7e8q).\n"
-              << "  - You can type 'show policy' on your turn to inspect root policy.\n";
+              << "  - Default backend is onnx-trt with backend opts 'batch=136,steps=1' (unless overridden).\n"
+              << "  - Default classic minibatch/max-prefetch are 136/136 (unless overridden).\n"
+              << "  - In human mode, type moves in white-oriented UCI coordinates for both sides (e.g. e2e4, e7e5).\n"
+              << "  - You can type 'show policy' on either side to inspect classic and rmcts root policy.\n"
+              << "  - Type 'quit' (or 'q'/'exit') to leave the program.\n";
 }
 
 std::string ToLower(std::string value) {
@@ -359,51 +450,259 @@ std::string ToLower(std::string value) {
     return value;
 }
 
-std::optional<bool> PromptHumanSide() {
-    while (true) {
-        std::cout << "Play as which side? (white/black): ";
-        std::string side;
-        if (!std::getline(std::cin, side)) return std::nullopt;
-        side = ToLower(side);
-        if (side == "white" || side == "w") return true;
-        if (side == "black" || side == "b") return false;
-        std::cout << "Please enter 'white' or 'black'.\n";
+std::string NormalizeMoveToWhitePov(std::string move_text,
+                                    bool black_to_move) {
+    if (!black_to_move) return move_text;
+    if (move_text.size() < 4) return move_text;
+
+    auto flip_rank = [](char rank) {
+        if (rank < '1' || rank > '8') return rank;
+        return static_cast<char>('1' + ('8' - rank));
+    };
+
+    move_text[1] = flip_rank(move_text[1]);
+    move_text[3] = flip_rank(move_text[3]);
+    return move_text;
+}
+
+std::string CanonicalizeMoveToWhitePov(const lczero::Position& pos,
+                                       const std::string& move_text) {
+    const lczero::ChessBoard& board = pos.GetBoard();
+
+    auto to_display = [&](const lczero::Move& parsed) {
+        lczero::Move display = parsed;
+        if (pos.IsBlackToMove()) {
+            display.Flip();
+        }
+        return display.ToString(false);
+    };
+
+    try {
+        const lczero::Move parsed = board.ParseMove(move_text);
+        return to_display(parsed);
+    } catch (const std::exception&) {
     }
+
+    if (pos.IsBlackToMove()) {
+        try {
+            const std::string flipped = NormalizeMoveToWhitePov(move_text, true);
+            const lczero::Move parsed = board.ParseMove(flipped);
+            return to_display(parsed);
+        } catch (const std::exception&) {
+        }
+    }
+
+    return move_text;
 }
 
-bool IsHumanTurn(const lczero::Position& pos, bool human_is_white) {
-    const bool white_to_move = !pos.IsBlackToMove();
-    return human_is_white ? white_to_move : !white_to_move;
-}
-
-void PrintPolicyTable(std::vector<BestMoveCaptureResponder::PolicyStat> stats) {
-    if (stats.empty()) {
+void PrintPolicyComparisonTable(
+    const std::vector<BestMoveCaptureResponder::PolicyStat>& classic_stats,
+    const std::vector<BestMoveCaptureResponder::PolicyStat>& rmcts_stats) {
+    if (classic_stats.empty() && rmcts_stats.empty()) {
         std::cout << "No policy stats available yet.\n";
         return;
     }
-    std::sort(stats.begin(), stats.end(), [](const auto& a, const auto& b) {
-        if (a.prior != b.prior) return a.prior > b.prior;
+
+    std::unordered_map<std::string, double> classic_prior;
+    std::unordered_map<std::string, double> rmcts_prior;
+    std::unordered_map<std::string, double> classic_post;
+    std::unordered_map<std::string, double> rmcts_post;
+    std::unordered_map<std::string, double> classic_q;
+    std::unordered_map<std::string, double> rmcts_q;
+    std::unordered_map<std::string, int> classic_visits;
+    std::unordered_map<std::string, int> rmcts_visits;
+
+    std::uint64_t classic_total_visits = 0;
+    std::uint64_t rmcts_total_visits = 0;
+    for (const auto& row : classic_stats) classic_total_visits += row.visits;
+    for (const auto& row : rmcts_stats) rmcts_total_visits += row.visits;
+
+    for (const auto& row : classic_stats) {
+        classic_prior[row.move] = row.prior;
+        classic_visits[row.move] = static_cast<int>(row.visits);
+        classic_post[row.move] = row.posterior.value_or(
+            classic_total_visits == 0
+                ? 0.0
+                : static_cast<double>(row.visits) /
+                      static_cast<double>(classic_total_visits));
+        if (row.q.has_value()) classic_q[row.move] = *row.q;
+    }
+    for (const auto& row : rmcts_stats) {
+        rmcts_prior[row.move] = row.prior;
+        rmcts_visits[row.move] = row.root_n.value_or(static_cast<int>(row.visits));
+        rmcts_post[row.move] = row.posterior.value_or(
+            rmcts_total_visits == 0
+                ? 0.0
+                : static_cast<double>(row.visits) /
+                      static_cast<double>(rmcts_total_visits));
+        if (row.q.has_value()) rmcts_q[row.move] = *row.q;
+    }
+
+    std::unordered_map<std::string, double> network_prior = classic_prior;
+    if (network_prior.empty()) network_prior = rmcts_prior;
+
+    auto weighted_value = [](const std::unordered_map<std::string, double>& policy,
+                             const std::unordered_map<std::string, double>& q_by_move)
+        -> std::optional<double> {
+        double sum = 0.0;
+        bool has_term = false;
+        for (const auto& [move, prob] : policy) {
+            const auto it = q_by_move.find(move);
+            if (it == q_by_move.end()) continue;
+            sum += prob * it->second;
+            has_term = true;
+        }
+        if (!has_term) return std::nullopt;
+        return sum;
+    };
+
+    std::unordered_map<std::string, double> prior_q_source = classic_q;
+    for (const auto& [move, q] : rmcts_q) {
+        if (!prior_q_source.count(move)) prior_q_source[move] = q;
+    }
+
+    const auto prior_v = weighted_value(network_prior, prior_q_source);
+    const auto classic_post_v = weighted_value(classic_post, classic_q);
+    const auto rmcts_post_v = weighted_value(rmcts_post, rmcts_q);
+
+    struct Row {
+        std::string move;
+        double rank_prior = 0.0;
+        double classic_post = 0.0;
+        double rmcts_post = 0.0;
+        int classic_visits = 0;
+        int rmcts_visits = 0;
+        std::optional<double> classic_q;
+        std::optional<double> rmcts_q;
+    };
+
+    std::vector<Row> rows;
+    rows.reserve(classic_prior.size() + rmcts_prior.size());
+
+    std::unordered_map<std::string, bool> seen;
+    for (const auto& [move, _] : classic_prior) seen[move] = true;
+    for (const auto& [move, _] : rmcts_prior) seen[move] = true;
+
+    for (const auto& [move, _] : seen) {
+        const double c_prior = classic_prior.count(move) ? classic_prior[move] : 0.0;
+        const double r_prior = rmcts_prior.count(move) ? rmcts_prior[move] : 0.0;
+        rows.push_back(Row{
+            .move = move,
+            .rank_prior = std::max(c_prior, r_prior),
+            .classic_post = classic_post.count(move) ? classic_post[move] : 0.0,
+            .rmcts_post = rmcts_post.count(move) ? rmcts_post[move] : 0.0,
+            .classic_visits = classic_visits.count(move) ? classic_visits[move] : 0,
+            .rmcts_visits = rmcts_visits.count(move) ? rmcts_visits[move] : 0,
+            .classic_q = classic_q.count(move) ? std::optional<double>(classic_q[move]) : std::nullopt,
+            .rmcts_q = rmcts_q.count(move) ? std::optional<double>(rmcts_q[move]) : std::nullopt,
+        });
+    }
+
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        if (a.rank_prior != b.rank_prior) return a.rank_prior > b.rank_prior;
         return a.move < b.move;
     });
 
-    std::uint64_t total_visits = 0;
-    for (const auto& row : stats) total_visits += row.visits;
+    auto print_opt_value = [](const std::optional<double>& value) {
+        if (value.has_value()) {
+            std::cout << std::fixed << std::setprecision(4) << *value
+                      << std::defaultfloat;
+        } else {
+            std::cout << "n/a";
+        }
+    };
 
-    std::cout << "Policy (ranked by prior):\n";
+    std::cout << "Values: prior_v=";
+    print_opt_value(prior_v);
+    std::cout << " classic_post_v=";
+    print_opt_value(classic_post_v);
+    std::cout << " rmcts_post_v=";
+    print_opt_value(rmcts_post_v);
+    std::cout << '\n';
+    std::cout << "Policy comparison (posterior, ranked by prior):\n";
     std::cout << std::left << std::setw(8) << "move"
               << std::right << std::setw(10) << "prior"
-              << std::setw(10) << "post"
-              << std::setw(10) << "visits" << '\n';
-    for (const auto& row : stats) {
-        const double posterior = total_visits == 0
-                                     ? 0.0
-                                     : static_cast<double>(row.visits) /
-                                           static_cast<double>(total_visits);
+              << std::right << std::setw(10) << "classic"
+              << std::setw(10) << "rmcts"
+              << std::setw(10) << "N_classic"
+              << std::setw(10) << "N_rmcts"
+              << std::setw(10) << "Q_classic"
+              << std::setw(10) << "Q_rmcts" << '\n';
+    for (const auto& row : rows) {
         std::cout << std::left << std::setw(8) << row.move
                   << std::right << std::setw(10) << std::fixed
+                  << std::setprecision(4) << row.rank_prior
+                  << std::right << std::setw(10) << std::fixed
+                  << std::setprecision(4) << row.classic_post
+                  << std::setw(10) << row.rmcts_post
+                  << std::setw(10) << row.classic_visits
+                  << std::setw(10) << row.rmcts_visits;
+
+        if (row.classic_q.has_value()) {
+            std::cout << std::setw(10) << std::fixed << std::setprecision(4)
+                      << *row.classic_q;
+        } else {
+            std::cout << std::setw(10) << "-";
+        }
+        if (row.rmcts_q.has_value()) {
+            std::cout << std::setw(10) << std::fixed << std::setprecision(4)
+                      << *row.rmcts_q;
+        } else {
+            std::cout << std::setw(10) << "-";
+        }
+        std::cout << std::defaultfloat << '\n';
+    }
+}
+
+void PrintRmctsDiagnostics(
+    const std::vector<BestMoveCaptureResponder::PolicyStat>& rmcts_stats) {
+    struct Row {
+        std::string move;
+        int action_id = -1;
+        double prior = 0.0;
+        double posterior = 0.0;
+        double q = 0.0;
+        int root_n = 0;
+    };
+
+    std::vector<Row> rows;
+    rows.reserve(rmcts_stats.size());
+    for (const auto& stat : rmcts_stats) {
+        if (!stat.q.has_value()) continue;
+        rows.push_back(Row{
+            .move = stat.move,
+            .action_id = stat.action_id.value_or(-1),
+            .prior = stat.prior,
+            .posterior = stat.posterior.value_or(0.0),
+            .q = *stat.q,
+            .root_n = stat.root_n.value_or(0),
+        });
+    }
+    if (rows.empty()) return;
+
+    std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) {
+        if (a.posterior != b.posterior) return a.posterior > b.posterior;
+        return a.move < b.move;
+    });
+
+    std::cout << "\nRMCTS diagnostics (top by posterior):\n";
+    std::cout << std::left << std::setw(8) << "move"
+              << std::right << std::setw(6) << "a"
+              << std::right << std::setw(10) << "prior"
+              << std::setw(10) << "post"
+              << std::setw(10) << "q"
+              << std::setw(8) << "n" << '\n';
+    const size_t limit = std::min<size_t>(12, rows.size());
+    for (size_t i = 0; i < limit; ++i) {
+        const auto& row = rows[i];
+        std::cout << std::left << std::setw(8) << row.move
+                  << std::right << std::setw(6) << row.action_id
+                  << std::right << std::setw(10) << std::fixed
                   << std::setprecision(4) << row.prior
-                  << std::setw(10) << posterior
-                  << std::setw(10) << row.visits << std::defaultfloat << '\n';
+                  << std::setw(10) << row.posterior
+                  << std::setw(10) << std::setprecision(3) << row.q
+                  << std::setw(8) << row.root_n
+                  << std::defaultfloat << '\n';
     }
 }
 
@@ -453,6 +752,8 @@ int main(int argc, const char** argv) {
     }
 
     auto* factory = lczero::SearchManager::Get()->GetFactoryByName(search_name);
+    auto* classic_factory = lczero::SearchManager::Get()->GetFactoryByName("classic");
+    auto* rmcts_factory = lczero::SearchManager::Get()->GetFactoryByName("rmcts");
     if (!factory) {
         std::cerr << "Search algorithm '" << search_name
                   << "' is not available." << std::endl;
@@ -461,8 +762,14 @@ int main(int argc, const char** argv) {
 
     lczero::OptionsParser options_parser;
     lczero::Engine::PopulateOptions(&options_parser);
+    if (classic_factory) classic_factory->PopulateParams(&options_parser);
+    if (rmcts_factory) rmcts_factory->PopulateParams(&options_parser);
     factory->PopulateParams(&options_parser);
     lczero::SharedBackendParams::Populate(&options_parser);
+    if (classic_factory) {
+        options_parser.GetMutableDefaultsOptions()->Set<bool>(
+            lczero::classic::BaseSearchParams::kVerboseStatsId, true);
+    }
 
     const bool is_classic_search = (search_name == "classic");
 
@@ -489,17 +796,20 @@ int main(int argc, const char** argv) {
         options_parser.GetMutableDefaultsOptions()->Set<std::string>(
             lczero::SharedBackendParams::kWeightsId, *weights_path);
     }
-    if (const auto backend =
-            ParseStringFlag(argc, argv, "--backend=");
-        backend) {
+        const auto backend_flag = ParseStringFlag(argc, argv, "--backend=");
+        const auto backend_opts_flag = ParseStringFlag(argc, argv, "--backend-opts=");
+
+        const std::string backend_value = backend_flag.value_or("onnx-trt");
         options_parser.GetMutableDefaultsOptions()->Set<std::string>(
-            lczero::SharedBackendParams::kBackendId, *backend);
-    }
-    if (const auto backend_opts =
-            ParseStringFlag(argc, argv, "--backend-opts=");
-        backend_opts) {
+        lczero::SharedBackendParams::kBackendId, backend_value);
+
+        if (backend_opts_flag) {
         options_parser.GetMutableDefaultsOptions()->Set<std::string>(
-            lczero::SharedBackendParams::kBackendOptionsId, *backend_opts);
+            lczero::SharedBackendParams::kBackendOptionsId, *backend_opts_flag);
+        } else if (backend_value == "onnx-trt") {
+        options_parser.GetMutableDefaultsOptions()->Set<std::string>(
+            lczero::SharedBackendParams::kBackendOptionsId,
+            "batch=136,steps=1");
     }
 
     int move_time_ms = 300;
@@ -540,6 +850,9 @@ int main(int argc, const char** argv) {
             options_parser.GetMutableDefaultsOptions()->Set<int>(
                 lczero::classic::BaseSearchParams::kMiniBatchSizeId,
                 *minibatch_size);
+        } else {
+            options_parser.GetMutableDefaultsOptions()->Set<int>(
+                lczero::classic::BaseSearchParams::kMiniBatchSizeId, 136);
         }
 
         if (const auto max_prefetch = ParseIntFlag(argc, argv, "--max-prefetch=");
@@ -552,6 +865,9 @@ int main(int argc, const char** argv) {
             options_parser.GetMutableDefaultsOptions()->Set<int>(
                 lczero::classic::SearchParams::kMaxPrefetchBatchId,
                 *max_prefetch);
+        } else {
+            options_parser.GetMutableDefaultsOptions()->Set<int>(
+                lczero::classic::SearchParams::kMaxPrefetchBatchId, 136);
         }
     }
 
@@ -580,20 +896,103 @@ int main(int argc, const char** argv) {
 
     const bool human_mode = HasFlag(argc, argv, "--human");
     const bool no_pause = HasFlag(argc, argv, "--no-pause");
-    bool human_is_white = true;
-    if (human_mode) {
-        auto selected_side = PromptHumanSide();
-        if (!selected_side) return 0;
-        human_is_white = *selected_side;
-    }
 
     BestMoveCaptureResponder responder;
-    lczero::Engine engine(*factory, options);
-    engine.RegisterUciResponder(&responder);
+    std::unique_ptr<lczero::Engine> engine;
+    if (!human_mode) {
+        engine = std::make_unique<lczero::Engine>(*factory, options);
+        engine->RegisterUciResponder(&responder);
+    }
+
+    auto fetch_policy_stats = [&](std::string_view target_search,
+                                  const lczero::Position& current_pos)
+        -> std::optional<std::vector<BestMoveCaptureResponder::PolicyStat>> {
+        if (target_search == search_name && engine) {
+            auto run_probe_once = [&]() {
+                responder.Reset();
+                engine->SetPosition(lczero::PositionToFen(current_pos), {});
+                lczero::GoParams params;
+                params.movetime = move_time_ms;
+                engine->Go(params);
+                engine->Wait();
+                auto stats = responder.GetPolicyStats();
+                for (auto& row : stats) {
+                    row.move = CanonicalizeMoveToWhitePov(current_pos, row.move);
+                }
+                return stats;
+            };
+
+            auto stats = run_probe_once();
+            auto all_zero_posterior = [](const std::vector<BestMoveCaptureResponder::PolicyStat>& rows) {
+                if (rows.empty()) return true;
+                for (const auto& row : rows) {
+                    const double post = row.posterior.value_or(static_cast<double>(row.visits));
+                    if (post > 0.0) return false;
+                }
+                return true;
+            };
+
+            if (all_zero_posterior(stats)) {
+                stats = run_probe_once();
+            }
+            return stats;
+        }
+
+        const lczero::SearchFactory* probe_factory = nullptr;
+        if (target_search == "classic") {
+            probe_factory = classic_factory;
+        } else if (target_search == "rmcts") {
+            probe_factory = rmcts_factory;
+        } else {
+            probe_factory = lczero::SearchManager::Get()->GetFactoryByName(
+                std::string(target_search));
+        }
+        if (!probe_factory) return std::nullopt;
+        try {
+            BestMoveCaptureResponder probe_responder;
+            lczero::Engine probe_engine(*probe_factory, options);
+            probe_engine.RegisterUciResponder(&probe_responder);
+
+            auto run_probe_once = [&]() {
+                probe_responder.Reset();
+                probe_engine.SetPosition(lczero::PositionToFen(current_pos), {});
+                lczero::GoParams params;
+                params.movetime = move_time_ms;
+                probe_engine.Go(params);
+                probe_engine.Wait();
+                auto stats = probe_responder.GetPolicyStats();
+                for (auto& row : stats) {
+                    row.move = CanonicalizeMoveToWhitePov(current_pos, row.move);
+                }
+                return stats;
+            };
+
+            auto stats = run_probe_once();
+            auto all_zero_posterior = [](const std::vector<BestMoveCaptureResponder::PolicyStat>& rows) {
+                if (rows.empty()) return true;
+                for (const auto& row : rows) {
+                    const double post = row.posterior.value_or(static_cast<double>(row.visits));
+                    if (post > 0.0) return false;
+                }
+                return true;
+            };
+
+            // First probe for a just-created engine can spend most time on warmup.
+            // Retry once if posterior is entirely zero to get a meaningful table.
+            if (all_zero_posterior(stats)) {
+                stats = run_probe_once();
+            }
+
+            probe_engine.UnregisterUciResponder(&probe_responder);
+            return stats;
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    };
 
     if (human_mode) {
-        std::cout << "--- STARTING HUMAN VS BOT ---" << std::endl;
-        std::cout << "Enter moves in UCI format (e.g. e2e4, e7e8q).\n";
+        std::cout << "--- STARTING HUMAN VS HUMAN ---" << std::endl;
+        std::cout << "Enter moves in white-oriented UCI format (e.g. e2e4, e7e5, e7e8q).\n";
     } else {
         std::cout << "--- STARTING BOT PLAYOUT ---" << std::endl;
     }
@@ -629,28 +1028,59 @@ int main(int argc, const char** argv) {
         }
 
         lczero::Move chosen_move;
-        if (human_mode && IsHumanTurn(pos, human_is_white)) {
+        if (human_mode) {
             while (true) {
-                std::cout << "Your move: ";
+                const bool white_to_move = !pos.IsBlackToMove();
+                std::cout << (white_to_move ? "White move: " : "Black move: ");
                 std::string move_text;
                 if (!std::getline(std::cin, move_text)) {
                     std::cout << "\nInput closed. Exiting." << std::endl;
-                    engine.UnregisterUciResponder(&responder);
+                    if (engine) {
+                        engine->UnregisterUciResponder(&responder);
+                    }
                     return 0;
                 }
                 const std::string normalized = ToLower(move_text);
+                if (normalized == "quit" || normalized == "q" || normalized == "exit") {
+                    std::cout << "Exiting." << std::endl;
+                    if (engine) {
+                        engine->UnregisterUciResponder(&responder);
+                    }
+                    return 0;
+                }
                 if (normalized == "show policy") {
-                    responder.Reset();
-                    engine.SetPosition(lczero::PositionToFen(pos), {});
-                    lczero::GoParams params;
-                    params.movetime = move_time_ms;
-                    engine.Go(params);
-                    engine.Wait();
-                    PrintPolicyTable(responder.GetPolicyStats());
+                    const auto classic_stats = fetch_policy_stats("classic", pos);
+                    const auto rmcts_stats = fetch_policy_stats("rmcts", pos);
+
+                    if (!classic_stats) {
+                        std::cout << "Classic search is not available.\n";
+                    } else if (!rmcts_stats) {
+                        std::cout << "RMCTS search is not available.\n";
+                    } else {
+                        PrintPolicyComparisonTable(*classic_stats, *rmcts_stats);
+                        PrintRmctsDiagnostics(*rmcts_stats);
+                    }
                     continue;
                 }
                 try {
-                    chosen_move = board.ParseMove(move_text);
+                    auto try_parse = [&](const std::string& text)
+                        -> std::optional<lczero::Move> {
+                        try {
+                            return board.ParseMove(text);
+                        } catch (const std::exception&) {
+                            return std::nullopt;
+                        }
+                    };
+
+                    auto parsed = try_parse(move_text);
+                    if (!parsed && pos.IsBlackToMove()) {
+                        parsed = try_parse(NormalizeMoveToWhitePov(move_text, true));
+                    }
+                    if (!parsed) {
+                        std::cout << "Invalid move format. Use UCI style like e2e4." << std::endl;
+                        continue;
+                    }
+                    chosen_move = *parsed;
                 } catch (const std::exception&) {
                     std::cout << "Invalid move format. Use UCI style like e2e4." << std::endl;
                     continue;
@@ -663,12 +1093,16 @@ int main(int argc, const char** argv) {
                 break;
             }
         } else {
+            if (!engine) {
+                std::cout << "Game Over: Engine is not available in this mode." << std::endl;
+                break;
+            }
             responder.Reset();
-            engine.SetPosition(lczero::PositionToFen(pos), {});
+            engine->SetPosition(lczero::PositionToFen(pos), {});
             lczero::GoParams params;
             params.movetime = move_time_ms;
-            engine.Go(params);
-            engine.Wait();
+            engine->Go(params);
+            engine->Wait();
 
             auto best_move = responder.GetBestMove();
             if (!best_move || best_move->is_null()) {
@@ -725,6 +1159,8 @@ int main(int argc, const char** argv) {
                   << " half-moves limit." << std::endl;
     }
 
-    engine.UnregisterUciResponder(&responder);
+    if (engine) {
+        engine->UnregisterUciResponder(&responder);
+    }
     return 0;
 }

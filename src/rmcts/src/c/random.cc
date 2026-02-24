@@ -1,8 +1,5 @@
 #include <cstdint>
-#include <cstring>
-#include <vector>
 #include "random.h"
-#include "game.h"
 
 uint64_t Knuth_seed = 0ull;
 
@@ -27,8 +24,7 @@ float Knuth_drand(void) {
   return ((float) (Knuth_seed >> 40)) / ((float) (1u << 24));
 }
 
-//assumes that p is a probability distribution
-// if not, then there are no guarantees!
+// Assumes p is a normalized probability distribution.
 int random_index(const float* const p, int const len_p) {
   float s = 0.0;
   int i;
@@ -39,31 +35,4 @@ int random_index(const float* const p, int const len_p) {
     if(s >= x) return i;
   }
   return len_p - 1;
-}
-
-
-void random_game_state(float* const g) {
-  int len_gamestate = gameLength();
-  int n = numActions();
-  std::vector<float> G(100 * len_gamestate);
-  std::vector<float> h(len_gamestate);
-  std::vector<int> actions(n);
-  int num_actions;
-  float terminal_score;
-  int i,j;
-  int a;
-
-  rootState(h.data());
-  memcpy(G.data(), h.data(), len_gamestate*sizeof(float));
-  i = 0;
-  while(!gameEnded(&terminal_score, h.data()) && (i+1)<100) {
-    num_actions = getValidActions(actions.data(), h.data());
-    if(num_actions == 0) break;
-    a = actions[Knuth_lrand() % num_actions];
-    nextState(G.data() + (i+1)*len_gamestate, h.data(), a);
-    memcpy(h.data(), G.data() + (i+1)*len_gamestate, len_gamestate*sizeof(float));
-    i++;
-  }
-  j = Knuth_lrand() % (i+1);
-  memcpy(g, G.data() + j*len_gamestate, len_gamestate*sizeof(float));
 }
