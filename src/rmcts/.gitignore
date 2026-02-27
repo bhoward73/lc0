@@ -1,0 +1,10 @@
+__pycache__
+build
+*~
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.fls
+*.log

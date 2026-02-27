@@ -1,0 +1,81 @@
+# Shared RMCTS experiment configuration
+#
+# This file is used by:
+#   - scripts/bot_match.py
+#   - scripts/single_position_compare.py
+#   - scripts/rmcts_plot.py
+#   - scripts/rmcts_run.py
+
+[common]
+# Path to lc0 binary used by the Python comparison scripts.
+engine = "build/release/lc0"
+
+# Shared args appended to RMCTS/classic/policy script invocations.
+# Keep this lightweight for general use; scripts can override per-section.
+#
+# Intentionally no hardcoded --weights path here so this file is portable
+# across developer machines and CI environments.
+#
+# For ONNX backends, set a valid network explicitly, for example:
+#   shared_args = "--backend=onnx-trt --weights=/path/to/net.pb.gz --backend-opts=batch=136,steps=1"
+shared_args = "--backend=onnx-trt --backend-opts=batch=136,steps=1"
+
+[bot_match]
+label_a = "rmcts"
+label_b = "classic"
+a_args = "rmcts"
+b_args = "classic --minibatch-size=136 --max-prefetch=136"
+positions = 20
+movetime_ms = 300
+opening_plies_min = 6
+opening_plies_max = 20
+max_plies = 220
+seed = 1
+
+[single_position_compare]
+mode = "analyze"
+driver = "rmcts"
+
+# For single-position analysis, include your network path in shared args.
+# Example:
+# shared_args = "--backend=onnx-trt --weights=/path/to/net.pb.gz"
+shared_args = "--backend=onnx-trt"
+
+rmcts_args = "rmcts --rmcts-chunk-sims=128 --backend-opts=batch=16,steps=1"
+classic_args = "classic --minibatch-size=136 --max-prefetch=136 --backend-opts=batch=136,steps=1"
+policy_args = "policyhead --backend-opts=batch=32,steps=1"
+
+movetime_ms = 500
+max_plies = 120
+opening_plies_min = 2
+opening_plies_max = 2
+seed = 1
+start_fen = ""
+out_csv = "/tmp/single_position_compare.csv"
+out_plot = "/tmp/single_position_compare.png"
+uci_timeout_s = 120.0
+overlay_rmcts_csv = ""
+overlay_classic_csv = ""
+overlay_out_plot = "/tmp/single_position_compare_overlay.png"
+
+[rmcts_plot]
+# Leave empty and pass CSV on CLI, or set this to a default trace file path.
+csv = ""
+fen = ""
+all_fens = false
+all_moves = false
+metric = "posterior"
+out_prefix = ""
+no_initial_prior = false
+
+[commands]
+# Used by scripts/rmcts_run.py.
+lc0_binary = "build/release/lc0"
+play_binary = "build/release/play"
+
+# Run one of these as first positional mode for lc0.
+uci_rmcts_args = "rmcts"
+uci_classic_args = "classic"
+
+# Extra args for the play utility.
+play_args = "--movetime-ms=300 --no-pause"

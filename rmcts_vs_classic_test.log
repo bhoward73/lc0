@@ -1,0 +1,62 @@
+Test started: 2026-02-24 08:32:51.626016
+Cycle 1, movetime 200ms, started 2026-02-24 08:32:51.626094
+Engine: build/onnxtrt/lc0
+A (rmcts) args: rmcts --backend=onnx-trt --backend-opts=batch=128,steps=1 --weights weights/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz
+B (classic) args: classic --minibatch-size=128 --max-prefetch=128 --backend=onnx-trt --backend-opts=batch=128,steps=1 --weights weights/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz
+Config: positions=999999 movetime_ms=200 opening_plies=[6,20] max_plies=220 seed=1
+<UciProtocol (pid=522439)>: stderr >> [1m[31m       _
+<UciProtocol (pid=522439)>: stderr >> |   _ | |
+<UciProtocol (pid=522439)>: stderr >> |_ |_ |_|[0m v0.33.0-dev+git.dirty built Feb 22 2026
+<UciProtocol (pid=522439)>: stderr >> Search algorithm: rmcts
+<UciProtocol (pid=522439)>: stderr >> Unknown command line argument: weights/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz.
+<UciProtocol (pid=522439)>: stderr >> 
+<UciProtocol (pid=522439)>: stderr >> For help run:
+<UciProtocol (pid=522439)>: stderr >>   build/onnxtrt/lc0 --help
+Traceback (most recent call last):
+  File "/home/ben/code/lc0/scripts/bot_match.py", line 273, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "/home/ben/code/lc0/scripts/bot_match.py", line 214, in main
+    engines = EnginePair(args.engine, a_cmd, b_cmd)
+  File "/home/ben/code/lc0/scripts/bot_match.py", line 58, in __init__
+    self.a = chess.engine.SimpleEngine.popen_uci([engine_path, *a_args])
+             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 3052, in popen_uci
+    return cls.popen(UciProtocol, command, timeout=timeout, debug=debug, setpgrp=setpgrp, **popen_args)
+           ~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 3044, in popen
+    return run_in_background(background, name=f"{cls.__name__} (command={command!r})", debug=debug)
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 77, in run_in_background
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/home/ben/anaconda3/lib/python3.13/concurrent/futures/_base.py", line 456, in result
+    return self.__get_result()
+           ~~~~~~~~~~~~~~~~~^^
+  File "/home/ben/anaconda3/lib/python3.13/concurrent/futures/_base.py", line 401, in __get_result
+    raise self._exception
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 71, in background
+    asyncio.run(coroutine(future), debug=debug)
+    ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ben/anaconda3/lib/python3.13/asyncio/runners.py", line 195, in run
+    return runner.run(main)
+           ~~~~~~~~~~^^^^^^
+  File "/home/ben/anaconda3/lib/python3.13/asyncio/runners.py", line 118, in run
+    return self._loop.run_until_complete(task)
+           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+  File "/home/ben/anaconda3/lib/python3.13/asyncio/base_events.py", line 725, in run_until_complete
+    return future.result()
+           ~~~~~~~~~~~~~^^
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 3036, in background
+    await asyncio.wait_for(protocol.initialize(), timeout)
+  File "/home/ben/anaconda3/lib/python3.13/asyncio/tasks.py", line 507, in wait_for
+    return await fut
+           ^^^^^^^^^
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 1407, in initialize
+    return await self.communicate(UciInitializeCommand)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ben/code/lc0/.venv/lib/python3.13/site-packages/chess/engine.py", line 1021, in communicate
+    return await command.result
+           ^^^^^^^^^^^^^^^^^^^^
+chess.engine.EngineTerminatedError: engine process died unexpectedly (exit code: 0)
+Cycle 1, movetime 200ms, finished 2026-02-24 08:32:51.832170
+Cycle 1, cooldown started 2026-02-24 08:32:51.832224

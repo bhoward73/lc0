@@ -3,7 +3,16 @@ import argparse
 import csv
 from collections import defaultdict
 import colorsys
+import sys
+
 import matplotlib.pyplot as plt
+
+from rmcts_params import (
+    apply_known_defaults,
+    load_config,
+    parse_config_path,
+    section_defaults,
+)
 
 
 def load_rows(path):
@@ -147,10 +156,18 @@ def plot_metric(
 
 
 def main():
+    config_path = parse_config_path(sys.argv[1:])
+    config = load_config(config_path)
+
     parser = argparse.ArgumentParser(
         description="Plot RMCTS per-chunk trajectories from RMCTS_TRACE_CSV output"
     )
-    parser.add_argument("csv", help="Path to RMCTS trace CSV")
+    parser.add_argument(
+        "--config",
+        default=str(config_path),
+        help="Path to shared RMCTS TOML config file.",
+    )
+    parser.add_argument("csv", nargs="?", default=None, help="Path to RMCTS trace CSV")
     parser.add_argument(
         "--fen",
         default=None,
@@ -182,7 +199,12 @@ def main():
         action="store_true",
         help="For posterior plots, disable plotting initial prior point at chunk 0.",
     )
+
+    apply_known_defaults(parser, section_defaults(config, "rmcts_plot"))
     args = parser.parse_args()
+
+    if not args.csv:
+        raise SystemExit("CSV path is required. Set it in config [rmcts_plot].csv or pass it on CLI.")
 
     rows = load_rows(args.csv)
     selected_fen = select_fen(

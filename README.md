@@ -59,6 +59,15 @@ Given those basics, the OS and backend specific instructions are below.
 5. `lc0` will be in `lc0/build/release/` directory
 6. Download a [neural network](https://lczero.org/play/networks/bestnets/) in the same directory as the binary (no need to unpack it).
 
+If your CUDA toolkit is older than your system compiler and `nvcc` fails during CUDA kernel compilation, use the helper script that pins a known-good host compiler and ONNX paths:
+```shell
+./build_cuda_safe.sh
+```
+You can override the CUDA host compiler if needed, for example:
+```shell
+NVCC_CCBIN=/usr/bin/g++-10 ./build_cuda_safe.sh
+```
+
 If you want to build with a different compiler, pass the `CC` and `CXX` environment variables:
 ```shell
 CC=clang CXX=clang++ ./build.sh

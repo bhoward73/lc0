@@ -1,6 +1,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <iomanip>
 #include <cstdint>
 #include <cstdio>
@@ -412,6 +413,17 @@ std::optional<int> ParseIntFlag(int argc, const char** argv,
     }
 }
 
+std::optional<float> ParseFloatFlag(int argc, const char** argv,
+                                    std::string_view prefix) {
+    const auto value = ParseStringFlag(argc, argv, prefix);
+    if (!value) return std::nullopt;
+    try {
+        return std::stof(*value);
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
 bool HasFlag(int argc, const char** argv, std::string_view flag) {
     for (int idx = 1; idx < argc; ++idx) {
         if (std::string_view(argv[idx]) == flag) return true;
@@ -429,6 +441,9 @@ void PrintHelp(const char* binary_name) {
               << "  --movetime-ms=N     Search time per move in milliseconds\n"
               << "  --move-overhead-ms=N  Time safety margin subtracted from movetime\n"
               << "  --threads=N         Number of search worker threads (0 = backend default)\n"
+              << "  --cpuct=X           Classic CPuct value (alias of --classic-cpuct)\n"
+              << "  --classic-cpuct=X   Classic CPuct value (exploration constant)\n"
+              << "  --rmcts-cpuct=X     RMCTS c_puct value\n"
               << "  --minibatch-size=N  Search minibatch size (0 = auto)\n"
               << "  --max-prefetch=N    Search prefetch batch size\n"
               << "  --max-half-moves=N  Stop after N half-moves (plies)\n"
@@ -836,6 +851,42 @@ int main(int argc, const char** argv) {
     if (is_classic_search) {
         options_parser.GetMutableDefaultsOptions()->Set<int>("threads", threads);
         options_parser.SetUciOption("Threads", std::to_string(threads));
+    }
+
+    std::optional<float> classic_cpuct =
+        ParseFloatFlag(argc, argv, "--classic-cpuct=");
+    if (!classic_cpuct) {
+        classic_cpuct = ParseFloatFlag(argc, argv, "--cpuct=");
+    }
+    if (classic_cpuct) {
+        if (!std::isfinite(*classic_cpuct) || *classic_cpuct <= 0.0f) {
+            std::cerr << "Invalid value for --classic-cpuct/--cpuct."
+                      << " Expected a positive finite number." << std::endl;
+            return 1;
+        }
+        if (!classic_factory) {
+            std::cerr << "Classic search is not available; cannot set --classic-cpuct."
+                      << std::endl;
+            return 1;
+        }
+        options_parser.GetMutableDefaultsOptions()->Set<float>(
+            lczero::classic::BaseSearchParams::kCpuctId, *classic_cpuct);
+        options_parser.SetUciOption("CPuct", std::to_string(*classic_cpuct));
+    }
+
+    if (const auto rmcts_cpuct = ParseFloatFlag(argc, argv, "--rmcts-cpuct=");
+        rmcts_cpuct) {
+        if (!std::isfinite(*rmcts_cpuct) || *rmcts_cpuct <= 0.0f) {
+            std::cerr << "Invalid value for --rmcts-cpuct."
+                      << " Expected a positive finite number." << std::endl;
+            return 1;
+        }
+        if (!rmcts_factory) {
+            std::cerr << "RMCTS search is not available; cannot set --rmcts-cpuct."
+                      << std::endl;
+            return 1;
+        }
+        options_parser.SetUciOption("RMCTSCpuct", std::to_string(*rmcts_cpuct));
     }
 
     if (is_classic_search) {

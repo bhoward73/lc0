@@ -4,7 +4,15 @@ import random
 import shlex
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
+
+from rmcts_params import (
+    apply_known_defaults,
+    load_config,
+    parse_config_path,
+    section_defaults,
+)
 
 try:
     import chess
@@ -139,12 +147,20 @@ def play_one_game(
     return score_from_white_result(board), white_sims, black_sims
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    config_path = parse_config_path(argv)
+    config = load_config(config_path)
+
     parser = argparse.ArgumentParser(
         description=(
             "Run paired bot-vs-bot matches from random starting positions. "
             "For each start, play two games with colors swapped."
         )
+    )
+    parser.add_argument(
+        "--config",
+        default=str(config_path),
+        help="Path to shared RMCTS TOML config file.",
     )
     parser.add_argument("--engine", default="build/onnxtrt/lc0")
     parser.add_argument(
@@ -161,11 +177,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--label-a", default="rmcts")
     parser.add_argument("--label-b", default="classic")
-    return parser.parse_args()
+
+    apply_known_defaults(parser, section_defaults(config, "bot_match"))
+    args = parser.parse_args(argv)
+    args.config = str(Path(args.config))
+    return args
 
 
 def main() -> int:
-    args = parse_args()
+    args = parse_args(sys.argv[1:])
 
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
@@ -200,6 +220,7 @@ def main() -> int:
     tally = Tally()
 
     print(f"Engine: {args.engine}", flush=True)
+    print(f"Config file: {args.config}", flush=True)
     print(f"A ({args.label_a}) args: {' '.join(a_cmd)}", flush=True)
     print(f"B ({args.label_b}) args: {' '.join(b_cmd)}", flush=True)
     print(

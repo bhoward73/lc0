@@ -1,0 +1,188 @@
+RMCTS v2 in lc0 vs original github.com/bhoward73/rmcts
+========================================================
+
+Date: 2026-02-25
+Context: This summary compares the RMCTS integration in this lc0 branch
+("rmcts" search mode in lc0) with the original standalone RMCTS repo
+(github.com/bhoward73/rmcts, per its README and project structure).
+
+Primary v1 paper reference:
+- https://github.com/bhoward73/rmcts/blob/main/paper/rmcts.pdf
+  (This document describes the original RMCTS algorithm/research framing.)
+
+
+1) High-level purpose
+---------------------
+Original rmcts repo:
+- Primarily a research/experiment codebase for comparing RMCTS vs MCTS-UCB.
+- Includes multiple game environments (e.g., Othello/Connect4/DotBox), timing
+  scripts, quality tests, and infrastructure for inference benchmarking.
+- Focuses on algorithm experiments and reproducible paper-style evaluations.
+
+RMCTS in lc0 (this branch):
+- RMCTS is integrated as a native lc0 search mode (`lc0 rmcts`) under UCI.
+- Goal is practical engine use and side-by-side comparison against lc0 classic
+  search in a real chess engine workflow.
+- Adds operational tooling to run timed games, compare outputs, and inspect
+  behavior from within lc0 ecosystem.
+
+
+2) The biggest algorithm/driver change: chunked execution
+----------------------------------------------------------
+Your key observation is correct and important.
+
+In lc0 RMCTS integration:
+- Search is run in repeated chunks (`--rmcts-chunk-sims`), not one monolithic
+  fixed simulation block.
+- Each chunk produces a posterior/root update, then the next chunk proceeds
+  from updated state/statistics.
+- This creates adaptive behavior over the course of one move: later chunks are
+  informed by surprising outcomes from earlier chunks.
+
+Why this matters:
+- Adaptivity: If earlier chunk outcomes shift confidence, later allocation and
+  resulting best move can change accordingly.
+- Better time control behavior: Chunk boundaries provide natural checkpoints for
+  stopping under move-time deadlines.
+
+
+3) Time-aware stopping (practical UCI constraint)
+-------------------------------------------------
+Original rmcts repo:
+- Research runs are typically controlled by experiment scripts and fixed run
+  conditions.
+
+lc0 RMCTS integration:
+- Uses lc0/UCI go-parameters to compute time budgets (`movetime`, clocks,
+  increments, movestogo heuristics).
+- Chunking is used as a checkpoint mechanism to stop cleanly when deadline is
+  reached.
+- This avoids the fragile approach of trying to guess exactly how many total
+  simulations fit in available time before search starts.
+
+In short:
+- Original: experiment-budget centric.
+- lc0 integration: chess clock centric.
+
+
+4) Integration depth: standalone research code vs engine-native search
+----------------------------------------------------------------------
+Original rmcts repo:
+- Separate project with its own build/test workflow and game adapters.
+
+lc0 RMCTS integration:
+- Wrapped inside lc0 search framework (`src/search/rmcts/*`) and registered as
+  an lc0 search algorithm (`rmcts`).
+- Uses lc0 move encoding, legal move generation, terminal detection, UCI
+  responder plumbing, thinking info, and bestmove reporting.
+- Works with lc0 backends (including ONNX/TensorRT paths already used by lc0).
+
+Practical effect:
+- You can test RMCTS where it matters operationally: same binary, same network,
+  same backend stack, same time manager context as classic.
+
+
+5) Persistent tree/state reuse across searches
+-----------------------------------------------
+The lc0 integration adds significant reuse machinery:
+- Exact root reuse when position key matches.
+- Branch restriction/re-rooting when new position is a continuation.
+- Reset when reuse is invalid.
+- Reuse summaries and retention statistics.
+
+This is an engine-operations feature not central to the standalone research
+repo’s purpose.
+
+
+6) Root policy/posterior lifecycle across epochs/chunks
+--------------------------------------------------------
+lc0 integration adds additional controls:
+- `--rmcts-epochs`
+- `--rmcts-posterior-weight`
+- `--rmcts-chunk-sims`
+
+Behavior:
+- Root prior can be blended with running posterior across epochs/chunks.
+- Posterior is normalized and carried forward as a running estimate.
+
+This creates a controlled prior↔posterior feedback loop inside one move search.
+
+
+7) Evaluation/cache behavior in lc0 integration
+------------------------------------------------
+lc0 RMCTS wrapper includes:
+- Eval caching by state key (FEN-based keying in wrapper path).
+- Fallback behavior if expensive eval budget is exhausted.
+- Backend prewarm option (`--rmcts-prewarm-on-newgame`).
+
+These are practical mechanisms to reduce startup spikes and improve runtime
+robustness in engine use.
+
+
+8) Observability and analysis tooling in this branch
+----------------------------------------------------
+This lc0 branch adds scripts and docs focused on rmcts-vs-classic comparison:
+- scripts/bot_match.py
+- scripts/single_position_compare.py
+- scripts/rmcts_plot.py
+- scripts/rmcts_run.py
+- shared config: src/rmcts/params.toml
+
+And RMCTS trace export support via env var in wrapper:
+- `RMCTS_TRACE_CSV` (chunk-level root traces for plotting).
+
+So compared to the original repo, this branch is more integrated with engine
+workflow and UCI testing ergonomics.
+
+
+9) What has NOT changed conceptually
+------------------------------------
+- Core RMCTS idea (posterior/optimized policy style search) remains from the
+  original RMCTS code lineage.
+- The lc0 work is mainly about embedding that idea into a chess-engine runtime
+  with time control, reusable trees, and operational tooling.
+
+
+10) Bottom line
+---------------
+If the original repo is “algorithm research RMCTS,” this lc0 branch is
+“engine-operational RMCTS.”
+
+The two biggest practical differences are exactly the ones you called out:
+1) Chunked repeated execution creates adaptive behavior across sub-runs.
+2) Chunk checkpoints make time-budgeted move play feasible under UCI clocks,
+   without needing brittle pre-guesses of total simulations.
+
+
+11) Quick glossary (v1 paper terms -> lc0 integration terms)
+-------------------------------------------------------------
+RMCTS prior policy (paper):
+- In lc0 integration, this is the root policy produced from backend eval for
+  the current root state, represented over lc0 action indices.
+
+RMCTS posterior policy (paper):
+- In lc0 integration, this is the per-chunk/post-epoch updated root policy used
+  for move choice and logging.
+
+Simulation budget N (paper experiments):
+- In lc0 integration, this is split operationally by
+  rmcts-num-sims, rmcts-epochs, and rmcts-chunk-sims.
+
+Single run over a fixed budget (paper-style framing):
+- In lc0 integration, often realized as repeated chunks with checkpointing and
+  optional early stop on time deadline.
+
+Experiment timing loop (paper scripts):
+- In lc0 integration, replaced/supplemented by UCI go timing and clock-aware
+  budget derivation.
+
+Algorithm comparison harness (paper):
+- In lc0 integration, realized by branch-specific scripts (bot_match,
+  single_position_compare, rmcts_plot) plus shared params.toml.
+
+Static testbed game adapters (paper repo):
+- In lc0 integration, replaced by direct bridge to lc0 chess state, legal move
+  generation, terminal detection, and UCI responders.
+
+
+(End)

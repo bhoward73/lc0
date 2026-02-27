@@ -5,6 +5,7 @@ from contextlib import suppress
 import math
 import random
 import shlex
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -12,6 +13,13 @@ from typing import Optional
 import chess
 import chess.engine
 import matplotlib.pyplot as plt
+
+from rmcts_params import (
+    apply_known_defaults,
+    load_config,
+    parse_config_path,
+    section_defaults,
+)
 
 
 @dataclass
@@ -326,33 +334,38 @@ def plot_overlay(path: Path, rmcts_rows: list[AnalysisRow], classic_rows: list[A
     plt.close(fig)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    config_path = parse_config_path(argv)
+    config = load_config(config_path)
+
     parser = argparse.ArgumentParser(
         description=(
             "Analyze one game line while querying RMCTS, classic, and policyhead "
             "on every position; save per-ply values and disagreement markers."
         )
     )
+    parser.add_argument(
+        "--config",
+        default=str(config_path),
+        help="Path to shared RMCTS TOML config file.",
+    )
     parser.add_argument("--engine", default="build/onnxtrt/lc0")
     parser.add_argument("--mode", choices=["analyze", "overlay"], default="analyze")
     parser.add_argument(
         "--shared-args",
-        default=(
-            "--backend=onnx-trt "
-            "--weights=weights/BT4-1024x15x32h-swa-6147500-policytune-332.pb.gz"
-        ),
+        default="--backend=onnx-trt",
     )
     parser.add_argument(
         "--rmcts-args",
-        default="rmcts --rmcts-chunk-sims=128 --backend-opts=gpu=1,batch=16,steps=1",
+        default="rmcts --rmcts-chunk-sims=128 --backend-opts=batch=16,steps=1",
     )
     parser.add_argument(
         "--classic-args",
-        default="classic --minibatch-size=136 --max-prefetch=136 --backend-opts=gpu=0,batch=136,steps=1",
+        default="classic --minibatch-size=136 --max-prefetch=136 --backend-opts=batch=136,steps=1",
     )
     parser.add_argument(
         "--policy-args",
-        default="policyhead --backend-opts=gpu=0,batch=32,steps=1",
+        default="policyhead --backend-opts=batch=32,steps=1",
     )
     parser.add_argument("--driver", choices=["rmcts", "classic"], default="rmcts")
     parser.add_argument("--movetime-ms", type=int, default=500)
@@ -367,11 +380,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--overlay-rmcts-csv", default="")
     parser.add_argument("--overlay-classic-csv", default="")
     parser.add_argument("--overlay-out-plot", default="/tmp/single_position_compare_overlay.png")
-    return parser.parse_args()
+
+    apply_known_defaults(parser, section_defaults(config, "single_position_compare"))
+    args = parser.parse_args(argv)
+    args.config = str(Path(args.config))
+    return args
 
 
 def main() -> int:
-    args = parse_args()
+    args = parse_args(sys.argv[1:])
 
     if args.mode == "overlay":
         if not args.overlay_rmcts_csv or not args.overlay_classic_csv:
@@ -409,6 +426,7 @@ def main() -> int:
     rows: list[AnalysisRow] = []
 
     print(f"Engine: {args.engine}")
+    print(f"Config file: {args.config}")
     print(f"RMCTS args: {' '.join(rmcts_cmd)}")
     print(f"Classic args: {' '.join(classic_cmd)}")
     print(f"Policy args: {' '.join(policy_cmd)}")
